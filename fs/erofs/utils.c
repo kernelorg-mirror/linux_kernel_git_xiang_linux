@@ -145,6 +145,53 @@ int erofs_workgroup_put(struct erofs_workgroup *grp)
 	return count;
 }
 
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+/* for cache-managed case, customized reclaim paths exist */
+static void erofs_workgroup_unfreeze_final(struct erofs_workgroup *grp)
+{
+	erofs_workgroup_unfreeze(grp, 0);
+	__erofs_workgroup_free(grp);
+}
+
+static bool erofs_try_to_release_workgroup(struct erofs_sb_info *sbi,
+					   struct erofs_workgroup *grp,
+					   bool cleanup)
+{
+	/*
+	 * for managed cache enabled, the refcount of workgroups
+	 * themselves could be < 0 (freezed). So there is no guarantee
+	 * that all refcount > 0 if managed cache is enabled.
+	 */
+	if (!erofs_workgroup_try_to_freeze(grp, 1))
+		return false;
+
+	/*
+	 * note that all cached pages should be unlinked
+	 * before delete it from the radix tree.
+	 * Otherwise some cached pages of an orphan old workgroup
+	 * could be still linked after the new one is available.
+	 */
+	if (erofs_try_to_free_all_cached_pages(sbi, grp)) {
+		erofs_workgroup_unfreeze(grp, 1);
+		return false;
+	}
+
+	/*
+	 * it is impossible to fail after the workgroup is freezed,
+	 * however in order to avoid some race conditions, add a
+	 * DBG_BUGON to observe this in advance.
+	 */
+	DBG_BUGON(xa_untag_pointer(radix_tree_delete(&sbi->workstn_tree,
+						     grp->index)) != grp);
+
+	/*
+	 * if managed cache is enable, the last refcount
+	 * should indicate the related workstation.
+	 */
+	erofs_workgroup_unfreeze_final(grp);
+	return true;
+}
+#else
 /* for nocache case, no customized reclaim path at all */
 static bool erofs_try_to_release_workgroup(struct erofs_sb_info *sbi,
 					   struct erofs_workgroup *grp,
@@ -165,7 +212,7 @@ static bool erofs_try_to_release_workgroup(struct erofs_sb_info *sbi,
 	erofs_workgroup_put(grp);
 	return true;
 }
-
+#endif
 
 unsigned long erofs_shrink_workstation(struct erofs_sb_info *sbi,
 				       unsigned long nr_shrink,
@@ -310,5 +357,60 @@ void erofs_exit_shrinker(void)
 	unregister_shrinker(&erofs_shrinker_info);
 }
 
+#endif
+
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+static const struct address_space_operations managed_cache_aops;
+
+struct inode *erofs_init_managed_cache(struct super_block *sb)
+{
+	struct inode *const inode = new_inode(sb);
+
+	if (unlikely(!inode))
+		return NULL;
+
+	set_nlink(inode, 1);
+	inode->i_size = OFFSET_MAX;
+
+	inode->i_mapping->a_ops = &managed_cache_aops;
+	mapping_set_gfp_mask(inode->i_mapping,
+			     GFP_NOFS | __GFP_HIGHMEM | __GFP_MOVABLE);
+	return inode;
+}
+
+static int erofs_managed_cache_releasepage(struct page *page, gfp_t gfp_mask)
+{
+	int ret = 1;	/* 0 - busy */
+	struct address_space *const mapping = page->mapping;
+
+	DBG_BUGON(!PageLocked(page));
+	DBG_BUGON(mapping->a_ops != &managed_cache_aops);
+
+	if (PagePrivate(page))
+		ret = erofs_try_to_free_cached_page(mapping, page);
+
+	return ret;
+}
+
+static void erofs_managed_cache_invalidatepage(struct page *page,
+					       unsigned int offset,
+					       unsigned int length)
+{
+	const unsigned int stop = length + offset;
+
+	DBG_BUGON(!PageLocked(page));
+
+	/* Check for potential overflow in debug mode */
+	DBG_BUGON(stop > PAGE_SIZE || stop < length);
+
+	if (offset == 0 && stop == PAGE_SIZE)
+		while (!erofs_managed_cache_releasepage(page, GFP_NOFS))
+			cond_resched();
+}
+
+static const struct address_space_operations managed_cache_aops = {
+	.releasepage = erofs_managed_cache_releasepage,
+	.invalidatepage = erofs_managed_cache_invalidatepage,
+};
 #endif
 

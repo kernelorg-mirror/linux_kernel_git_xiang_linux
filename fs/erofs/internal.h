@@ -52,6 +52,11 @@ struct erofs_fault_info {
 };
 #endif
 
+#ifdef CONFIG_EROFS_FS_ZIP_CACHE_READAROUND
+#define EROFS_FS_HAS_MANAGED_CACHE	(2)
+#elif defined(CONFIG_EROFS_FS_ZIP_CACHE_READAHEAD)
+#define EROFS_FS_HAS_MANAGED_CACHE	(1)
+#endif
 /* EROFS_SUPER_MAGIC_V1 to represent the whole file system */
 #define EROFS_SUPER_MAGIC   EROFS_SUPER_MAGIC_V1
 
@@ -73,6 +78,10 @@ struct erofs_sb_info {
 	unsigned int max_sync_decompress_pages;
 
 	unsigned int shrinker_run_no;
+#endif
+
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+	struct inode *managed_cache;
 #endif
 	u32 blocks;
 	u32 meta_blkaddr;
@@ -543,6 +552,14 @@ static inline int erofs_init_shrinker(void) { return 0; }
 static inline void erofs_exit_shrinker(void) {}
 static inline int z_erofs_init_zip_subsystem(void) { return 0; }
 static inline void z_erofs_exit_zip_subsystem(void) {}
+#endif
+
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+struct inode *erofs_init_managed_cache(struct super_block *sb);
+int erofs_try_to_free_all_cached_pages(struct erofs_sb_info *sbi,
+				       struct erofs_workgroup *egrp);
+int erofs_try_to_free_cached_page(struct address_space *mapping,
+				  struct page *page);
 #endif
 
 #endif

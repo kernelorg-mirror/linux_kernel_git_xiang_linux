@@ -114,3 +114,41 @@ config EROFS_FS_CLUSTER_PAGE_LIMIT
 	  less than 2. Otherwise, the image will be refused
 	  to mount on this kernel.
 
+choice
+	prompt "EROFS Data Decompression mode"
+	depends on EROFS_FS_ZIP
+	default EROFS_FS_ZIP_CACHE_READAROUND
+	help
+	  EROFS supports three options for decompression.
+	  "In-place I/O Only" consumes the minimum memory
+	  with lowest random read.
+
+	  "Cached Decompression for readaround" consumes
+	  the maximum memory with highest random read.
+
+	  If unsure, select "Cached Decompression for readaround"
+
+config EROFS_FS_ZIP_CACHE_DISABLED
+	bool "In-place I/O Only"
+	help
+	  Read compressed data into page cache and do in-place
+	  I/O decompression directly.
+
+config EROFS_FS_ZIP_CACHE_READAHEAD
+	bool "Cached Decompression for readahead"
+	help
+	  For each request, it caches the last compressed page
+	  for further reading.
+	  It still does in-place I/O for the rest compressed pages.
+
+config EROFS_FS_ZIP_CACHE_READAROUND
+	bool "Cached Decompression for readaround"
+	help
+	  For each request, it caches the both end compressed pages
+	  for further reading.
+	  It still does in-place I/O for the rest compressed pages.
+
+	  Recommended for performance priority.
+
+endchoice
+

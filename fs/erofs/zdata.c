@@ -162,6 +162,118 @@ struct z_erofs_decompress_frontend {
 static struct page *z_pagemap_global[Z_EROFS_VMAP_GLOBAL_PAGES];
 static DEFINE_MUTEX(z_pagemap_global_lock);
 
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+static void preload_compressed_pages(struct z_erofs_collector *clt,
+				     struct address_space *mc,
+				     enum z_erofs_cache_alloctype type,
+				     struct list_head *pagepool)
+{
+	const struct z_erofs_pcluster *pcl = clt->pcl;
+	const unsigned int clusterpages = BIT(pcl->clusterbits);
+	struct page **pages = clt->compressedpages;
+	pgoff_t index = pcl->obj.index + (pages - pcl->compressed_pages);
+	bool standalone = true;
+
+	if (clt->mode < COLLECT_PRIMARY_FOLLOWED)
+		return;
+
+	for (; pages < pcl->compressed_pages + clusterpages; ++pages) {
+		struct page *page;
+		compressed_page_t t;
+
+		/* the compressed page was loaded before */
+		if (READ_ONCE(*pages))
+			continue;
+
+		page = find_get_page(mc, index);
+
+		if (page) {
+			t = tag_compressed_page_justfound(page);
+		} else if (type == DELAYEDALLOC) {
+			t = tagptr_init(compressed_page_t, PAGE_UNALLOCATED);
+		} else {	/* DONTALLOC */
+			if (standalone)
+				clt->compressedpages = pages;
+			standalone = false;
+			continue;
+		}
+
+		if (!cmpxchg_relaxed(pages, NULL, tagptr_cast_ptr(t)))
+			continue;
+
+		if (page)
+			put_page(page);
+	}
+
+	if (standalone)		/* downgrade to PRIMARY_FOLLOWED_NOINPLACE */
+		clt->mode = COLLECT_PRIMARY_FOLLOWED_NOINPLACE;
+}
+
+/* called by erofs_shrinker to get rid of all compressed_pages */
+int erofs_try_to_free_all_cached_pages(struct erofs_sb_info *sbi,
+				       struct erofs_workgroup *grp)
+{
+	struct z_erofs_pcluster *const pcl =
+		container_of(grp, struct z_erofs_pcluster, obj);
+	struct address_space *const mapping = MNGD_MAPPING(sbi);
+	const unsigned int clusterpages = BIT(pcl->clusterbits);
+	int i;
+
+	/*
+	 * refcount of workgroup is now freezed as 1,
+	 * therefore no need to worry about available decompression users.
+	 */
+	for (i = 0; i < clusterpages; ++i) {
+		struct page *page = pcl->compressed_pages[i];
+
+		if (!page)
+			continue;
+
+		/* block other users from reclaiming or migrating the page */
+		if (!trylock_page(page))
+			return -EBUSY;
+
+		if (unlikely(page->mapping != mapping))
+			continue;
+
+		/* barrier is implied in the following 'unlock_page' */
+		pcl->compressed_pages[i] = NULL;
+		set_page_private(page, 0);
+		ClearPagePrivate(page);
+
+		unlock_page(page);
+		put_page(page);
+	}
+	return 0;
+}
+
+int erofs_try_to_free_cached_page(struct address_space *mapping,
+				  struct page *page)
+{
+	struct z_erofs_pcluster *const pcl = (void *)page_private(page);
+	const unsigned int clusterpages = BIT(pcl->clusterbits);
+	int ret = 0;	/* 0 - busy */
+
+	if (erofs_workgroup_try_to_freeze(&pcl->obj, 1)) {
+		unsigned int i;
+
+		for (i = 0; i < clusterpages; ++i) {
+			if (pcl->compressed_pages[i] == page) {
+				pcl->compressed_pages[i] = NULL;
+				ret = 1;
+				break;
+			}
+		}
+		erofs_workgroup_unfreeze(&pcl->obj, 1);
+
+		if (ret) {
+			ClearPagePrivate(page);
+			put_page(page);
+		}
+	}
+	return ret;
+}
+#else
 static void preload_compressed_pages(struct z_erofs_collector *clt,
 				     struct address_space *mc,
 				     enum z_erofs_cache_alloctype type,
@@ -169,6 +281,7 @@ static void preload_compressed_pages(struct z_erofs_collector *clt,
 {
 	/* nowhere to load compressed pages from */
 }
+#endif
 
 /* page_type must be Z_EROFS_PAGE_TYPE_EXCLUSIVE */
 static inline bool try_inplace_io(struct z_erofs_collector *clt,
@@ -440,6 +553,13 @@ static inline struct page *__stagingpage_alloc(struct list_head *pagepool,
 static bool should_alloc_managed_pages(struct z_erofs_decompress_frontend *fe,
 				       erofs_off_t la)
 {
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+	if (fe->backmost)
+		return true;
+#if (EROFS_FS_HAS_MANAGED_CACHE >= 2)
+	return la < fe->headoffset;
+#endif
+#endif
 	return false;
 }
 
@@ -1002,6 +1122,9 @@ out:
 
 /* define decompression jobqueue types */
 enum {
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+	JQ_BYPASS,
+#endif
 	JQ_SUBMIT,
 	NR_JOBQUEUES,
 };
@@ -1012,12 +1135,56 @@ static void *jobqueueset_init(struct super_block *sb,
 			      struct z_erofs_unzip_io *fgq,
 			      bool forcefg)
 {
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+	/*
+	 * if managed cache is enabled, bypass jobqueue is needed,
+	 * no need to read from device for all pclusters in this queue.
+	 */
+	q[JQ_BYPASS] = jobqueue_init(sb, fgq + JQ_BYPASS, true);
+	qtail[JQ_BYPASS] = &q[JQ_BYPASS]->head;
+#endif
+
 	q[JQ_SUBMIT] = jobqueue_init(sb, fgq + JQ_SUBMIT, forcefg);
 	qtail[JQ_SUBMIT] = &q[JQ_SUBMIT]->head;
 
 	return tagptr_cast_ptr(tagptr_fold(tagptr1_t, q[JQ_SUBMIT], !forcefg));
 }
 
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+static void move_to_bypass_jobqueue(struct z_erofs_pcluster *pcl,
+				    z_erofs_next_pcluster_t qtail[],
+				    z_erofs_next_pcluster_t owned_head)
+{
+	z_erofs_next_pcluster_t *const submit_qtail = qtail[JQ_SUBMIT];
+	z_erofs_next_pcluster_t *const bypass_qtail = qtail[JQ_BYPASS];
+
+	DBG_BUGON(owned_head == Z_EROFS_PCLUSTER_TAIL_CLOSED);
+	if (owned_head == Z_EROFS_PCLUSTER_TAIL)
+		owned_head = Z_EROFS_PCLUSTER_TAIL_CLOSED;
+
+	WRITE_ONCE(pcl->next, Z_EROFS_PCLUSTER_TAIL_CLOSED);
+
+	WRITE_ONCE(*submit_qtail, owned_head);
+	WRITE_ONCE(*bypass_qtail, &pcl->next);
+
+	qtail[JQ_BYPASS] = &pcl->next;
+}
+
+static bool postsubmit_is_all_bypassed(struct z_erofs_unzip_io *q[],
+				       unsigned int nr_bios,
+				       bool force_fg)
+{
+	/*
+	 * although background is preferred, no one is pending for submission.
+	 * don't issue workqueue for decompression but drop it directly instead.
+	 */
+	if (force_fg || nr_bios)
+		return false;
+
+	kvfree(container_of(q[JQ_SUBMIT], struct z_erofs_unzip_io_sb, io));
+	return true;
+}
+#else
 static void move_to_bypass_jobqueue(struct z_erofs_pcluster *pcl,
 				    z_erofs_next_pcluster_t qtail[],
 				    z_erofs_next_pcluster_t owned_head)
@@ -1034,6 +1201,7 @@ static bool postsubmit_is_all_bypassed(struct z_erofs_unzip_io *q[],
 	DBG_BUGON(!nr_bios);
 	return false;
 }
+#endif
 
 static bool z_erofs_vle_submit_all(struct super_block *sb,
 				   z_erofs_next_pcluster_t owned_head,
@@ -1145,6 +1313,9 @@ static void z_erofs_submit_and_unzip(struct super_block *sb,
 				    pagepool, io, force_fg))
 		return;
 
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+	z_erofs_vle_unzip_all(sb, &io[JQ_BYPASS], pagepool);
+#endif
 	if (!force_fg)
 		return;
 

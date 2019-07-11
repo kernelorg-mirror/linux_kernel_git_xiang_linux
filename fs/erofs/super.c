@@ -327,7 +327,6 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 #ifdef CONFIG_EROFS_FS_XATTR
 	sb->s_xattr = erofs_xattr_handlers;
 #endif
-
 	/* set erofs default mount options */
 	default_options(sbi);
 
@@ -364,6 +363,12 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 		return -ENOMEM;
 
 	erofs_shrinker_register(sb);
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+	/* sb->s_umount is locked here, SB_ACTIVE and SB_BORN are not set */
+	sbi->managed_cache = erofs_init_managed_cache(sb);
+	if (unlikely(!sbi->managed_cache))
+		return -ENOMEM;
+#endif
 
 	if (!silent)
 		infoln("mounted on %s with opts: %s.", sb->s_id, (char *)data);
@@ -399,6 +404,14 @@ static void erofs_kill_sb(struct super_block *sb)
 /* called when ->s_root is non-NULL */
 static void erofs_put_super(struct super_block *sb)
 {
+	struct erofs_sb_info *const sbi = EROFS_SB(sb);
+
+	DBG_BUGON(!sbi);
+
+#ifdef EROFS_FS_HAS_MANAGED_CACHE
+	iput(sbi->managed_cache);
+	sbi->managed_cache = NULL;
+#endif
 	erofs_shrinker_unregister(sb);
 }
 
