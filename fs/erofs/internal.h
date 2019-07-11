@@ -69,6 +69,9 @@ struct erofs_sb_info {
 	/* the dedicated workstation for compression */
 	struct radix_tree_root workstn_tree;
 
+	/* threshold for decompression synchronously */
+	unsigned int max_sync_decompress_pages;
+
 	unsigned int shrinker_run_no;
 #endif
 	u32 blocks;
@@ -223,6 +226,8 @@ static inline int erofs_wait_on_workgroup_freezed(struct erofs_workgroup *grp)
 }
 #endif
 
+#define DEFAULT_MAX_SYNC_DECOMPRESS_PAGES	3
+
 #ifdef CONFIG_EROFS_FS_CLUSTER_PAGE_LIMIT
 #define Z_EROFS_CLUSTER_MAX_PAGES       (CONFIG_EROFS_FS_CLUSTER_PAGE_LIMIT)
 #else
@@ -328,6 +333,9 @@ static inline bool is_inode_flat_inline(struct inode *inode)
 extern const struct super_operations erofs_sops;
 
 extern const struct address_space_operations erofs_raw_access_aops;
+#ifdef CONFIG_EROFS_FS_ZIP
+extern const struct address_space_operations z_erofs_vle_normalaccess_aops;
+#endif
 
 /*
  * Logical to physical block mapping, used by erofs_map_blocks()
@@ -494,7 +502,7 @@ int erofs_namei(struct inode *dir, struct qstr *name,
 /* dir.c */
 extern const struct file_operations erofs_dir_fops;
 
-/* utils.c */
+/* utils.c / zdata.c */
 struct page *erofs_allocpage(struct list_head *pool, gfp_t gfp, bool nofail);
 
 #if (EROFS_PCPUBUF_NR_PAGES > 0)
@@ -520,17 +528,21 @@ int erofs_register_workgroup(struct super_block *sb,
 			     struct erofs_workgroup *grp, bool tag);
 unsigned long erofs_shrink_workstation(struct erofs_sb_info *sbi,
 				       unsigned long nr_shrink, bool cleanup);
-static inline void erofs_workgroup_free_rcu(struct erofs_workgroup *grp) {}
+void erofs_workgroup_free_rcu(struct erofs_workgroup *grp);
 
 void erofs_shrinker_register(struct super_block *sb);
 void erofs_shrinker_unregister(struct super_block *sb);
 int __init erofs_init_shrinker(void);
 void erofs_exit_shrinker(void);
+int __init z_erofs_init_zip_subsystem(void);
+void z_erofs_exit_zip_subsystem(void);
 #else
 static inline void erofs_shrinker_register(struct super_block *sb) {}
 static inline void erofs_shrinker_unregister(struct super_block *sb) {}
 static inline int erofs_init_shrinker(void) { return 0; }
 static inline void erofs_exit_shrinker(void) {}
+static inline int z_erofs_init_zip_subsystem(void) { return 0; }
+static inline void z_erofs_exit_zip_subsystem(void) {}
 #endif
 
 #endif

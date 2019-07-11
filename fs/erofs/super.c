@@ -200,6 +200,9 @@ static unsigned int erofs_get_fault_rate(struct erofs_sb_info *sbi)
 /* set up default EROFS parameters */
 static void default_options(struct erofs_sb_info *sbi)
 {
+#ifdef CONFIG_EROFS_FS_ZIP
+	sbi->max_sync_decompress_pages = DEFAULT_MAX_SYNC_DECOMPRESS_PAGES;
+#endif
 #ifdef CONFIG_EROFS_FS_XATTR
 	set_opt(sbi, XATTR_USER);
 #endif
@@ -422,6 +425,9 @@ static int __init erofs_module_init(void)
 	err = erofs_init_shrinker();
 	if (err)
 		goto shrinker_err;
+	err = z_erofs_init_zip_subsystem();
+	if (err)
+		goto zip_err;
 	err = register_filesystem(&erofs_fs_type);
 	if (err)
 		goto fs_err;
@@ -430,6 +436,8 @@ static int __init erofs_module_init(void)
 	return 0;
 
 fs_err:
+	z_erofs_exit_zip_subsystem();
+zip_err:
 	erofs_exit_shrinker();
 shrinker_err:
 	erofs_exit_inode_cache();
@@ -440,6 +448,7 @@ icache_err:
 static void __exit erofs_module_exit(void)
 {
 	unregister_filesystem(&erofs_fs_type);
+	z_erofs_exit_zip_subsystem();
 	erofs_exit_shrinker();
 	erofs_exit_inode_cache();
 	infoln("successfully finalize erofs");
