@@ -80,6 +80,16 @@ config EROFS_FS_SECURITY
 
 	  If you are not using a security module, say N.
 
+config EROFS_FS_USE_VM_MAP_RAM
+	bool "EROFS VM_MAP_RAM Support"
+	depends on EROFS_FS
+	default y
+	help
+	  use vm_map_ram / vm_unmap_ram pair which have better performance
+	  instead of vmap/vunmap pair.
+
+	  If you don't know what these are, say Y.
+
 config EROFS_FS_ZIP
 	bool "EROFS Data Compression Support"
 	depends on EROFS_FS
