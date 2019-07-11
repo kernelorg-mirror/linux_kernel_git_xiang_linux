@@ -20,7 +20,8 @@
 
 #define show_mflags(flags) __print_flags(flags, "",	\
 	{ EROFS_MAP_MAPPED,	"M" },			\
-	{ EROFS_MAP_META,	"I" })
+	{ EROFS_MAP_META,	"I" },			\
+	{ EROFS_MAP_ZIPPED,	"Z" })
 
 TRACE_EVENT(erofs_lookup,
 
@@ -172,6 +173,13 @@ DEFINE_EVENT(erofs__map_blocks_enter, erofs_map_blocks_flatmode_enter,
 	TP_ARGS(inode, map, flags)
 );
 
+DEFINE_EVENT(erofs__map_blocks_enter, z_erofs_map_blocks_iter_enter,
+	TP_PROTO(struct inode *inode, struct erofs_map_blocks *map,
+		 unsigned int flags),
+
+	TP_ARGS(inode, map, flags)
+);
+
 DECLARE_EVENT_CLASS(erofs__map_blocks_exit,
 	TP_PROTO(struct inode *inode, struct erofs_map_blocks *map,
 		 unsigned int flags, int ret),
@@ -213,6 +221,13 @@ DECLARE_EVENT_CLASS(erofs__map_blocks_exit,
 DEFINE_EVENT(erofs__map_blocks_exit, erofs_map_blocks_flatmode_exit,
 	TP_PROTO(struct inode *inode, struct erofs_map_blocks *map,
 		 unsigned flags, int ret),
+
+	TP_ARGS(inode, map, flags, ret)
+);
+
+DEFINE_EVENT(erofs__map_blocks_exit, z_erofs_map_blocks_iter_exit,
+	TP_PROTO(struct inode *inode, struct erofs_map_blocks *map,
+		 unsigned int flags, int ret),
 
 	TP_ARGS(inode, map, flags, ret)
 );
