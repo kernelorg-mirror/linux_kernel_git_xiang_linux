@@ -49,7 +49,7 @@ struct erofs_fault_info {
 	unsigned int inject_rate;
 	unsigned int inject_type;
 };
-#endif
+#endif	/* CONFIG_EROFS_FAULT_INJECTION */
 
 /* EROFS_SUPER_MAGIC_V1 to represent the whole file system */
 #define EROFS_SUPER_MAGIC   EROFS_SUPER_MAGIC_V1
@@ -138,7 +138,7 @@ static inline bool time_to_inject(struct erofs_sb_info *sbi, int type)
 static inline void erofs_show_injection_info(int type)
 {
 }
-#endif
+#endif	/* !CONFIG_EROFS_FAULT_INJECTION */
 
 static inline void *erofs_kmalloc(struct erofs_sb_info *sbi,
 					size_t size, gfp_t flags)
@@ -236,8 +236,14 @@ static inline int erofs_wait_on_workgroup_freezed(struct erofs_workgroup *grp)
 	DBG_BUGON(v == EROFS_LOCKED_MAGIC);
 	return v;
 }
-#endif
-#endif	/* CONFIG_EROFS_FS_ZIP */
+#endif	/* !CONFIG_SMP */
+
+/* hard limit of pages per compressed cluster */
+#define Z_EROFS_CLUSTER_MAX_PAGES       (CONFIG_EROFS_FS_CLUSTER_PAGE_LIMIT)
+#define EROFS_PCPUBUF_NR_PAGES          Z_EROFS_CLUSTER_MAX_PAGES
+#else
+#define EROFS_PCPUBUF_NR_PAGES          0
+#endif	/* !CONFIG_EROFS_FS_ZIP */
 
 /* we strictly follow PAGE_SIZE and no buffer head yet */
 #define LOG_BLOCK_SIZE		PAGE_SHIFT
@@ -255,15 +261,6 @@ static inline int erofs_wait_on_workgroup_freezed(struct erofs_workgroup *grp)
 #endif
 
 #define ROOT_NID(sb)		((sb)->root_nid)
-
-#ifdef CONFIG_EROFS_FS_ZIP
-/* hard limit of pages per compressed cluster */
-#define Z_EROFS_CLUSTER_MAX_PAGES       (CONFIG_EROFS_FS_CLUSTER_PAGE_LIMIT)
-
-#define EROFS_PCPUBUF_NR_PAGES          Z_EROFS_CLUSTER_MAX_PAGES
-#else
-#define EROFS_PCPUBUF_NR_PAGES          0
-#endif
 
 #define erofs_blknr(addr)       ((addr) / EROFS_BLKSIZ)
 #define erofs_blkoff(addr)      ((addr) % EROFS_BLKSIZ)
@@ -304,7 +301,7 @@ struct erofs_vnode {
 			unsigned char  z_logical_clusterbits;
 			unsigned char  z_physical_clusterbits[2];
 		};
-#endif
+#endif	/* CONFIG_EROFS_FS_ZIP */
 	};
 	/* the corresponding vfs inode */
 	struct inode vfs_inode;
@@ -412,7 +409,7 @@ static inline int z_erofs_map_blocks_iter(struct inode *inode,
 {
 	return -ENOTSUPP;
 }
-#endif
+#endif	/* !CONFIG_EROFS_FS_ZIP */
 
 /* data.c */
 static inline struct bio *erofs_grab_bio(struct super_block *sb,
@@ -548,7 +545,7 @@ static inline int erofs_init_shrinker(void) { return 0; }
 static inline void erofs_exit_shrinker(void) {}
 static inline int z_erofs_init_zip_subsystem(void) { return 0; }
 static inline void z_erofs_exit_zip_subsystem(void) {}
-#endif
+#endif	/* !CONFIG_EROFS_FS_ZIP */
 
 #endif	/* __EROFS_INTERNAL_H */
 
