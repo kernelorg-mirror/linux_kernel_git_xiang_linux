@@ -49,7 +49,7 @@ struct page *__erofs_get_meta_page(struct super_block *sb,
 	/* prefer retrying in the allocator to blindly looping below */
 	const gfp_t gfp = mapping_gfp_constraint(mapping, ~__GFP_FS) |
 		(nofail ? __GFP_NOFAIL : 0);
-	unsigned int io_retries = nofail ? EROFS_IO_MAX_RETRIES_NOFAIL : 0;
+	unsigned int io_retries = nofail ? 5 : 0;
 	struct page *page;
 	int err;
 
