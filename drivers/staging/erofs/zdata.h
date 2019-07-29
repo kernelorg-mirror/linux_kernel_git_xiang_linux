@@ -93,6 +93,7 @@ struct z_erofs_unzip_io {
 	union {
 		wait_queue_head_t wait;
 		struct work_struct work;
+		struct llist_node list;
 	} u;
 };
 

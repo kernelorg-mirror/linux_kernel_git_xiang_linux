@@ -9,6 +9,8 @@
 #include "zdata.h"
 #include "compress.h"
 #include <linux/prefetch.h>
+#include <linux/llist.h>
+#include <linux/delay.h>
 
 #include <trace/events/erofs.h>
 
@@ -678,6 +680,8 @@ err_out:
 	goto out;
 }
 
+static struct llist_head decompress_pendinglist;
+
 static void z_erofs_vle_unzip_kickoff(void *ptr, int bios)
 {
 	tagptr1_t t = tagptr_init(tagptr1_t, ptr);
@@ -694,8 +698,22 @@ static void z_erofs_vle_unzip_kickoff(void *ptr, int bios)
 		return;
 	}
 
-	if (!atomic_add_return(bios, &io->pending_bios))
+	if (!atomic_add_return(bios, &io->pending_bios)) {
+		struct llist_node *const oh = decompress_pendinglist.first;
+
+		if (oh) {
+			WRITE_ONCE(io->u.list.next, oh);
+			/*
+			 * paired with the only xchg (implying full barrier)
+			 * in z_erofs_vle_unzip_wq.
+			 */
+			smp_wmb();
+			if (cmpxchg_relaxed(&decompress_pendinglist.first, oh,
+					    &io->u.list) == oh)
+				return;
+		}
 		queue_work(z_erofs_workqueue, &io->u.work);
+	}
 }
 
 static inline void z_erofs_vle_read_endio(struct bio *bio)
@@ -951,11 +969,31 @@ static void z_erofs_vle_unzip_wq(struct work_struct *work)
 {
 	struct z_erofs_unzip_io_sb *iosb =
 		container_of(work, struct z_erofs_unzip_io_sb, io.u.work);
+	struct llist_node *node;
 	LIST_HEAD(pagepool);
+	unsigned int npass;
 
 	DBG_BUGON(iosb->io.head == Z_EROFS_PCLUSTER_TAIL_CLOSED);
+
+	cmpxchg_relaxed(&decompress_pendinglist.first, NULL, LIST_POISON1);
 	z_erofs_vle_unzip_all(iosb->sb, &iosb->io, &pagepool);
 
+	for (npass = 10; npass; --npass) {
+		/* paired with smp_wmb() in z_erofs_vle_unzip_kickoff */
+		node = xchg(&decompress_pendinglist.first, npass > 1 ? LIST_POISON1 : NULL);
+		if (!node || node == LIST_POISON1) {
+			udelay(20);
+			continue;
+		}
+
+		do {
+			iosb = container_of(node, struct z_erofs_unzip_io_sb,
+					    io.u.list);
+			z_erofs_vle_unzip_all(iosb->sb, &iosb->io, &pagepool);
+			node = node->next;
+			DBG_BUGON(!node);
+		} while (node != LIST_POISON1);
+	}
 	put_pages_list(&pagepool);
 	kvfree(iosb);
 }
