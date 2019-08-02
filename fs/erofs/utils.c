@@ -144,24 +144,48 @@ int erofs_workgroup_put(struct erofs_workgroup *grp)
 	return count;
 }
 
-/* for nocache case, no customized reclaim path at all */
+static void erofs_workgroup_unfreeze_final(struct erofs_workgroup *grp)
+{
+	erofs_workgroup_unfreeze(grp, 0);
+	__erofs_workgroup_free(grp);
+}
+
 static bool erofs_try_to_release_workgroup(struct erofs_sb_info *sbi,
 					   struct erofs_workgroup *grp,
 					   bool cleanup)
 {
-	int cnt = atomic_read(&grp->refcount);
-
-	DBG_BUGON(cnt <= 0);
-	DBG_BUGON(cleanup && cnt != 1);
-
-	if (cnt > 1)
+	/*
+	 * If managed cache is on, refcount of workgroups
+	 * themselves could be < 0 (freezed). In other words,
+	 * there is no guarantee that all refcounts > 0.
+	 */
+	if (!erofs_workgroup_try_to_freeze(grp, 1))
 		return false;
 
+	/*
+	 * Note that all cached pages should be unattached
+	 * before deleted from the radix tree. Otherwise some
+	 * cached pages could be still attached to the orphan
+	 * old workgroup when the new one is available in the tree.
+	 */
+	if (erofs_try_to_free_all_cached_pages(sbi, grp)) {
+		erofs_workgroup_unfreeze(grp, 1);
+		return false;
+	}
+
+	/*
+	 * It's impossible to fail after the workgroup is freezed,
+	 * however in order to avoid some race conditions, add a
+	 * DBG_BUGON to observe this in advance.
+	 */
 	DBG_BUGON(xa_untag_pointer(radix_tree_delete(&sbi->workstn_tree,
 						     grp->index)) != grp);
 
-	/* (rarely) could be grabbed again when freeing */
-	erofs_workgroup_put(grp);
+	/*
+	 * If managed cache is on, last refcount should indicate
+	 * the related workstation.
+	 */
+	erofs_workgroup_unfreeze_final(grp);
 	return true;
 }
 
