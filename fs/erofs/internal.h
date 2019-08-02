@@ -62,6 +62,9 @@ typedef u32 erofs_blk_t;
 struct erofs_sb_info {
 	u32 blocks;
 	u32 meta_blkaddr;
+#ifdef CONFIG_EROFS_FS_XATTR
+	u32 xattr_blkaddr;
+#endif
 
 	/* inode slot unit size in bit shift */
 	unsigned char islotbits;
@@ -132,6 +135,8 @@ static inline void *erofs_kmalloc(struct erofs_sb_info *sbi,
 #define EROFS_I_SB(inode) ((struct erofs_sb_info *)(inode)->i_sb->s_fs_info)
 
 /* Mount flags set via mount options or defaults */
+#define EROFS_MOUNT_XATTR_USER		0x00000010
+#define EROFS_MOUNT_POSIX_ACL		0x00000020
 #define EROFS_MOUNT_FAULT_INJECTION	0x00000040
 
 #define clear_opt(sbi, option)	((sbi)->mount_opt &= ~EROFS_MOUNT_##option)
@@ -166,12 +171,23 @@ static inline erofs_off_t iloc(struct erofs_sb_info *sbi, erofs_nid_t nid)
 	return blknr_to_addr(sbi->meta_blkaddr) + (nid << sbi->islotbits);
 }
 
+/* atomic flag definitions */
+#define EROFS_V_EA_INITED_BIT	0
+
+/* bitlock definitions (arranged in reverse order) */
+#define EROFS_V_BL_XATTR_BIT	(BITS_PER_LONG - 1)
 struct erofs_vnode {
 	erofs_nid_t nid;
+
+	/* atomic flags (including bitlocks) */
+	unsigned long flags;
 
 	unsigned char datamode;
 	unsigned char inode_isize;
 	unsigned short xattr_isize;
+
+	unsigned int xattr_shared_count;
+	unsigned int *xattr_shared_xattrs;
 
 	erofs_blk_t raw_blkaddr;
 	/* the corresponding vfs inode */
