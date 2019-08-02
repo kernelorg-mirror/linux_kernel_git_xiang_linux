@@ -72,6 +72,12 @@ struct erofs_sb_info {
 	unsigned int max_sync_decompress_pages;
 
 	unsigned int shrinker_run_no;
+
+	/* current strategy of how to use managed cache */
+	unsigned char cache_strategy;
+
+	/* pseudo inode to manage cached pages */
+	struct inode *managed_cache;
 #endif	/* CONFIG_EROFS_FS_ZIP */
 	u32 blocks;
 	u32 meta_blkaddr;
@@ -157,6 +163,12 @@ static inline void *erofs_kmalloc(struct erofs_sb_info *sbi,
 #define test_opt(sbi, option)	((sbi)->mount_opt & EROFS_MOUNT_##option)
 
 #ifdef CONFIG_EROFS_FS_ZIP
+enum {
+	EROFS_ZIP_CACHE_DISABLED,
+	EROFS_ZIP_CACHE_READAHEAD,
+	EROFS_ZIP_CACHE_READAROUND
+};
+
 #define EROFS_LOCKED_MAGIC     (INT_MIN | 0xE0F510CCL)
 
 /* basic unit of the workstation of a super_block */
@@ -524,6 +536,10 @@ int __init erofs_init_shrinker(void);
 void erofs_exit_shrinker(void);
 int __init z_erofs_init_zip_subsystem(void);
 void z_erofs_exit_zip_subsystem(void);
+int erofs_try_to_free_all_cached_pages(struct erofs_sb_info *sbi,
+				       struct erofs_workgroup *egrp);
+int erofs_try_to_free_cached_page(struct address_space *mapping,
+				  struct page *page);
 #else
 static inline void erofs_shrinker_register(struct super_block *sb) {}
 static inline void erofs_shrinker_unregister(struct super_block *sb) {}

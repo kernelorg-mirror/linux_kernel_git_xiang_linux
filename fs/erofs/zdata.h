@@ -101,9 +101,12 @@ struct z_erofs_unzip_io_sb {
 	struct super_block *sb;
 };
 
-#define MNGD_MAPPING(sbi)	(NULL)
+#define MNGD_MAPPING(sbi)	((sbi)->managed_cache->i_mapping)
 static inline bool erofs_page_is_managed(const struct erofs_sb_info *sbi,
-					 struct page *page) { return false; }
+					 struct page *page)
+{
+	return page->mapping == MNGD_MAPPING(sbi);
+}
 
 #define Z_EROFS_ONLINEPAGE_COUNT_BITS   2
 #define Z_EROFS_ONLINEPAGE_COUNT_MASK   ((1 << Z_EROFS_ONLINEPAGE_COUNT_BITS) - 1)

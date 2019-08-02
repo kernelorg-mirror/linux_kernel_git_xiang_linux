@@ -202,10 +202,45 @@ static unsigned int erofs_get_fault_rate(struct erofs_sb_info *sbi)
 }
 #endif
 
+#ifdef CONFIG_EROFS_FS_ZIP
+static int erofs_build_cache_strategy(struct erofs_sb_info *sbi,
+				      substring_t *args)
+{
+	const char *cs = match_strdup(args);
+	int err = 0;
+
+	if (!cs) {
+		errln("Not enough memory to store cache strategy");
+		return -ENOMEM;
+	}
+
+	if (!strcmp(cs, "disabled")) {
+		sbi->cache_strategy = EROFS_ZIP_CACHE_DISABLED;
+	} else if (!strcmp(cs, "readahead")) {
+		sbi->cache_strategy = EROFS_ZIP_CACHE_READAHEAD;
+	} else if (!strcmp(cs, "readaround")) {
+		sbi->cache_strategy = EROFS_ZIP_CACHE_READAROUND;
+	} else {
+		errln("Unrecognized cache strategy \"%s\"", cs);
+		err = -EINVAL;
+	}
+	kfree(cs);
+	return err;
+}
+#else
+static int erofs_build_cache_strategy(struct erofs_sb_info *sbi,
+				      substring_t *args)
+{
+	infoln("EROFS compression is disabled, so cache strategy is ignored");
+	return 0;
+}
+#endif
+
 /* set up default EROFS parameters */
 static void default_options(struct erofs_sb_info *sbi)
 {
 #ifdef CONFIG_EROFS_FS_ZIP
+	sbi->cache_strategy = EROFS_ZIP_CACHE_READAROUND;
 	sbi->max_sync_decompress_pages = 3;
 #endif
 #ifdef CONFIG_EROFS_FS_XATTR
@@ -222,6 +257,7 @@ enum {
 	Opt_acl,
 	Opt_noacl,
 	Opt_fault_injection,
+	Opt_cache_strategy,
 	Opt_err
 };
 
@@ -231,6 +267,7 @@ static match_table_t erofs_tokens = {
 	{Opt_acl, "acl"},
 	{Opt_noacl, "noacl"},
 	{Opt_fault_injection, "fault_injection=%u"},
+	{Opt_cache_strategy, "cache_strategy=%s"},
 	{Opt_err, NULL}
 };
 
@@ -288,6 +325,11 @@ static int parse_options(struct super_block *sb, char *options)
 			if (err)
 				return err;
 			break;
+		case Opt_cache_strategy:
+			err = erofs_build_cache_strategy(EROFS_SB(sb), args);
+			if (err)
+				return err;
+			break;
 		default:
 			errln("Unrecognized mount option \"%s\" or missing value", p);
 			return -EINVAL;
@@ -295,6 +337,65 @@ static int parse_options(struct super_block *sb, char *options)
 	}
 	return 0;
 }
+
+#ifdef CONFIG_EROFS_FS_ZIP
+static const struct address_space_operations managed_cache_aops;
+
+static int managed_cache_releasepage(struct page *page, gfp_t gfp_mask)
+{
+	int ret = 1;	/* 0 - busy */
+	struct address_space *const mapping = page->mapping;
+
+	DBG_BUGON(!PageLocked(page));
+	DBG_BUGON(mapping->a_ops != &managed_cache_aops);
+
+	if (PagePrivate(page))
+		ret = erofs_try_to_free_cached_page(mapping, page);
+
+	return ret;
+}
+
+static void managed_cache_invalidatepage(struct page *page,
+					 unsigned int offset,
+					 unsigned int length)
+{
+	const unsigned int stop = length + offset;
+
+	DBG_BUGON(!PageLocked(page));
+
+	/* Check for potential overflow in debug mode */
+	DBG_BUGON(stop > PAGE_SIZE || stop < length);
+
+	if (offset == 0 && stop == PAGE_SIZE)
+		while (!managed_cache_releasepage(page, GFP_NOFS))
+			cond_resched();
+}
+
+static const struct address_space_operations managed_cache_aops = {
+	.releasepage = managed_cache_releasepage,
+	.invalidatepage = managed_cache_invalidatepage,
+};
+
+static int erofs_init_managed_cache(struct super_block *sb)
+{
+	struct erofs_sb_info *const sbi = EROFS_SB(sb);
+	struct inode *const inode = new_inode(sb);
+
+	if (unlikely(!inode))
+		return -ENOMEM;
+
+	set_nlink(inode, 1);
+	inode->i_size = OFFSET_MAX;
+
+	inode->i_mapping->a_ops = &managed_cache_aops;
+	mapping_set_gfp_mask(inode->i_mapping,
+			     GFP_NOFS | __GFP_HIGHMEM | __GFP_MOVABLE);
+	sbi->managed_cache = inode;
+	return 0;
+}
+#else
+static int erofs_init_managed_cache(struct super_block *sb) { return 0; }
+#endif
 
 static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 {
@@ -330,7 +431,6 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 #ifdef CONFIG_EROFS_FS_XATTR
 	sb->s_xattr = erofs_xattr_handlers;
 #endif
-
 	/* set erofs default mount options */
 	default_options(sbi);
 
@@ -367,6 +467,10 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 		return -ENOMEM;
 
 	erofs_shrinker_register(sb);
+	/* sb->s_umount is already locked, SB_ACTIVE and SB_BORN are not set */
+	err = erofs_init_managed_cache(sb);
+	if (unlikely(err))
+		return err;
 
 	if (!silent)
 		infoln("mounted on %s with opts: %s.", sb->s_id, (char *)data);
@@ -402,7 +506,15 @@ static void erofs_kill_sb(struct super_block *sb)
 /* called when ->s_root is non-NULL */
 static void erofs_put_super(struct super_block *sb)
 {
+	struct erofs_sb_info *const sbi = EROFS_SB(sb);
+
+	DBG_BUGON(!sbi);
+
 	erofs_shrinker_unregister(sb);
+#ifdef CONFIG_EROFS_FS_ZIP
+	iput(sbi->managed_cache);
+	sbi->managed_cache = NULL;
+#endif
 }
 
 static struct file_system_type erofs_fs_type = {
@@ -500,6 +612,18 @@ static int erofs_show_options(struct seq_file *seq, struct dentry *root)
 	if (test_opt(sbi, FAULT_INJECTION))
 		seq_printf(seq, ",fault_injection=%u",
 			   erofs_get_fault_rate(sbi));
+#ifdef CONFIG_EROFS_FS_ZIP
+	if (sbi->cache_strategy == EROFS_ZIP_CACHE_DISABLED) {
+		seq_puts(seq, ",cache_strategy=disabled");
+	} else if (sbi->cache_strategy == EROFS_ZIP_CACHE_READAHEAD) {
+		seq_puts(seq, ",cache_strategy=readahead");
+	} else if (sbi->cache_strategy == EROFS_ZIP_CACHE_READAROUND) {
+		seq_puts(seq, ",cache_strategy=readaround");
+	} else {
+		seq_puts(seq, ",cache_strategy=(unknown)");
+		DBG_BUGON(1);
+	}
+#endif
 	return 0;
 }
 
