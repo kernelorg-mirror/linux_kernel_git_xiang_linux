@@ -172,9 +172,15 @@ err_out:
 int erofs_map_blocks(struct inode *inode,
 		     struct erofs_map_blocks *map, int flags)
 {
-	if (is_inode_layout_compression(inode))
-		return -EOPNOTSUPP;
+	if (unlikely(is_inode_layout_compression(inode))) {
+		int err = z_erofs_map_blocks_iter(inode, map, flags);
 
+		if (map->mpage) {
+			put_page(map->mpage);
+			map->mpage = NULL;
+		}
+		return err;
+	}
 	return erofs_map_blocks_flatmode(inode, map, flags);
 }
 

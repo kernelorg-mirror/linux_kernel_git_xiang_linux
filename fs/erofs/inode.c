@@ -213,7 +213,7 @@ static int fill_inode(struct inode *inode, int isdir)
 		}
 
 		if (is_inode_layout_compression(inode)) {
-			err = -EOPNOTSUPP;
+			err = z_erofs_fill_inode(inode);
 			goto out_unlock;
 		}
 
