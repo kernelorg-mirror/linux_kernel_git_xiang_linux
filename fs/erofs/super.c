@@ -354,6 +354,8 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 	if (unlikely(!sb->s_root))
 		return -ENOMEM;
 
+	erofs_shrinker_register(sb);
+
 	if (!silent)
 		infoln("mounted on %s with opts: %s.", sb->s_id, (char *)data);
 	return 0;
@@ -383,6 +385,12 @@ static void erofs_kill_sb(struct super_block *sb)
 		return;
 	kfree(sbi);
 	sb->s_fs_info = NULL;
+}
+
+/* called when ->s_root is non-NULL */
+static void erofs_put_super(struct super_block *sb)
+{
+	erofs_shrinker_unregister(sb);
 }
 
 static struct file_system_type erofs_fs_type = {
@@ -496,6 +504,7 @@ out:
 }
 
 const struct super_operations erofs_sops = {
+	.put_super = erofs_put_super,
 	.alloc_inode = alloc_inode,
 	.free_inode = free_inode,
 	.statfs = erofs_statfs,
