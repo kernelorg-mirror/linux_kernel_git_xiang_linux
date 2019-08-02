@@ -11,7 +11,7 @@
 #include <linux/statfs.h>
 #include <linux/parser.h>
 #include <linux/seq_file.h>
-#include "internal.h"
+#include "xattr.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/erofs.h>
@@ -60,6 +60,8 @@ static void free_inode(struct inode *inode)
 	/* be careful RCU symlink path (see ext4_inode_info->i_data)! */
 	if (is_inode_fast_symlink(inode))
 		kfree(inode->i_link);
+
+	kfree(vi->xattr_shared_xattrs);
 
 	kmem_cache_free(erofs_inode_cachep, vi);
 }
@@ -118,6 +120,9 @@ static int superblock_read(struct super_block *sb)
 
 	sbi->blocks = le32_to_cpu(layout->blocks);
 	sbi->meta_blkaddr = le32_to_cpu(layout->meta_blkaddr);
+#ifdef CONFIG_EROFS_FS_XATTR
+	sbi->xattr_blkaddr = le32_to_cpu(layout->xattr_blkaddr);
+#endif
 	sbi->islotbits = ffs(sizeof(struct erofs_inode_v1)) - 1;
 	sbi->root_nid = le16_to_cpu(layout->root_nid);
 	sbi->inos = le64_to_cpu(layout->inos);
@@ -200,14 +205,28 @@ static unsigned int erofs_get_fault_rate(struct erofs_sb_info *sbi)
 /* set up default EROFS parameters */
 static void default_options(struct erofs_sb_info *sbi)
 {
+#ifdef CONFIG_EROFS_FS_XATTR
+	set_opt(sbi, XATTR_USER);
+#endif
+#ifdef CONFIG_EROFS_FS_POSIX_ACL
+	set_opt(sbi, POSIX_ACL);
+#endif
 }
 
 enum {
+	Opt_user_xattr,
+	Opt_nouser_xattr,
+	Opt_acl,
+	Opt_noacl,
 	Opt_fault_injection,
 	Opt_err
 };
 
 static match_table_t erofs_tokens = {
+	{Opt_user_xattr, "user_xattr"},
+	{Opt_nouser_xattr, "nouser_xattr"},
+	{Opt_acl, "acl"},
+	{Opt_noacl, "noacl"},
 	{Opt_fault_injection, "fault_injection=%u"},
 	{Opt_err, NULL}
 };
@@ -231,6 +250,36 @@ static int parse_options(struct super_block *sb, char *options)
 		token = match_token(p, erofs_tokens, args);
 
 		switch (token) {
+#ifdef CONFIG_EROFS_FS_XATTR
+		case Opt_user_xattr:
+			set_opt(EROFS_SB(sb), XATTR_USER);
+			break;
+		case Opt_nouser_xattr:
+			clear_opt(EROFS_SB(sb), XATTR_USER);
+			break;
+#else
+		case Opt_user_xattr:
+			infoln("user_xattr options not supported");
+			break;
+		case Opt_nouser_xattr:
+			infoln("nouser_xattr options not supported");
+			break;
+#endif
+#ifdef CONFIG_EROFS_FS_POSIX_ACL
+		case Opt_acl:
+			set_opt(EROFS_SB(sb), POSIX_ACL);
+			break;
+		case Opt_noacl:
+			clear_opt(EROFS_SB(sb), POSIX_ACL);
+			break;
+#else
+		case Opt_acl:
+			infoln("acl options not supported");
+			break;
+		case Opt_noacl:
+			infoln("noacl options not supported");
+			break;
+#endif
 		case Opt_fault_injection:
 			err = erofs_build_fault_attr(EROFS_SB(sb), args);
 			if (err)
@@ -275,6 +324,10 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 
 	sb->s_op = &erofs_sops;
 
+#ifdef CONFIG_EROFS_FS_XATTR
+	sb->s_xattr = erofs_xattr_handlers;
+#endif
+
 	/* set erofs default mount options */
 	default_options(sbi);
 
@@ -284,6 +337,11 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 
 	if (!silent)
 		infoln("root inode @ nid %llu", ROOT_NID(sbi));
+
+	if (test_opt(sbi, POSIX_ACL))
+		sb->s_flags |= SB_POSIXACL;
+	else
+		sb->s_flags &= ~SB_POSIXACL;
 
 	/* get the root inode */
 	inode = erofs_iget(sb, ROOT_NID(sbi), true);
@@ -398,6 +456,18 @@ static int erofs_show_options(struct seq_file *seq, struct dentry *root)
 {
 	struct erofs_sb_info *sbi __maybe_unused = EROFS_SB(root->d_sb);
 
+#ifdef CONFIG_EROFS_FS_XATTR
+	if (test_opt(sbi, XATTR_USER))
+		seq_puts(seq, ",user_xattr");
+	else
+		seq_puts(seq, ",nouser_xattr");
+#endif
+#ifdef CONFIG_EROFS_FS_POSIX_ACL
+	if (test_opt(sbi, POSIX_ACL))
+		seq_puts(seq, ",acl");
+	else
+		seq_puts(seq, ",noacl");
+#endif
 	if (test_opt(sbi, FAULT_INJECTION))
 		seq_printf(seq, ",fault_injection=%u",
 			   erofs_get_fault_rate(sbi));
@@ -415,6 +485,11 @@ static int erofs_remount(struct super_block *sb, int *flags, char *data)
 	err = parse_options(sb, data);
 	if (err)
 		goto out;
+
+	if (test_opt(sbi, POSIX_ACL))
+		sb->s_flags |= SB_POSIXACL;
+	else
+		sb->s_flags &= ~SB_POSIXACL;
 
 	*flags |= SB_RDONLY;
 	return 0;
