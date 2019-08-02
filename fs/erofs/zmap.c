@@ -23,7 +23,9 @@ int z_erofs_fill_inode(struct inode *inode)
 		vi->z_physical_clusterbits[1] = vi->z_logical_clusterbits;
 		set_bit(EROFS_V_Z_INITED_BIT, &vi->flags);
 	}
-	return -EOPNOTSUPP;
+
+	inode->i_mapping->a_ops = &z_erofs_vle_normalaccess_aops;
+	return 0;
 }
 
 static int fill_inode_lazy(struct inode *inode)
