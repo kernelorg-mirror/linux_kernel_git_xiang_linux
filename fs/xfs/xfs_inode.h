@@ -56,6 +56,8 @@ typedef struct xfs_inode {
 	uint64_t		i_delayed_blks;	/* count of delay alloc blks */
 
 	struct xfs_icdinode	i_d;		/* most of ondisk inode */
+	xfs_agino_t		i_prev_unlinked;
+	xfs_agino_t		i_next_unlinked;
 
 	/* VFS inode */
 	struct inode		i_vnode;	/* embedded VFS inode */
@@ -462,9 +464,6 @@ extern struct kmem_zone	*xfs_inode_zone;
 
 /* The default CoW extent size hint. */
 #define XFS_DEFAULT_COWEXTSZ_HINT 32
-
-int xfs_iunlink_init(struct xfs_perag *pag);
-void xfs_iunlink_destroy(struct xfs_perag *pag);
 
 void xfs_end_io(struct work_struct *work);
 

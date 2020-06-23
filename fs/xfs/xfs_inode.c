@@ -1876,211 +1876,123 @@ xfs_inactive(
 }
 
 /*
- * In-Core Unlinked List Lookups
- * =============================
- *
- * Every inode is supposed to be reachable from some other piece of metadata
- * with the exception of the root directory.  Inodes with a connection to a
- * file descriptor but not linked from anywhere in the on-disk directory tree
- * are collectively known as unlinked inodes, though the filesystem itself
- * maintains links to these inodes so that on-disk metadata are consistent.
- *
- * XFS implements a per-AG on-disk hash table of unlinked inodes.  The AGI
- * header contains a number of buckets that point to an inode, and each inode
- * record has a pointer to the next inode in the hash chain.  This
- * singly-linked list causes scaling problems in the iunlink remove function
- * because we must walk that list to find the inode that points to the inode
- * being removed from the unlinked hash bucket list.
- *
- * What if we modelled the unlinked list as a collection of records capturing
- * "X.next_unlinked = Y" relations?  If we indexed those records on Y, we'd
- * have a fast way to look up unlinked list predecessors, which avoids the
- * slow list walk.  That's exactly what we do here (in-core) with a per-AG
- * rhashtable.
- *
- * Because this is a backref cache, we ignore operational failures since the
- * iunlink code can fall back to the slow bucket walk.  The only errors that
- * should bubble out are for obviously incorrect situations.
- *
- * All users of the backref cache MUST hold the AGI buffer lock to serialize
- * access or have otherwise provided for concurrency control.
+ * Find an inode on the unlinked list. This does not take references to the
+ * inode, we have existence guarantees by holding the AGI buffer lock and
+ * that only unlinked, referenced inodes can be on the unlinked inode list.
+ * If we don't find the inode in cache, then let the caller handle the
+ * situation.
  */
-
-/* Capture a "X.next_unlinked = Y" relationship. */
-struct xfs_iunlink {
-	struct rhash_head	iu_rhash_head;
-	xfs_agino_t		iu_agino;		/* X */
-	xfs_agino_t		iu_next_unlinked;	/* Y */
-};
-
-/* Unlinked list predecessor lookup hashtable construction */
-static int
-xfs_iunlink_obj_cmpfn(
-	struct rhashtable_compare_arg	*arg,
-	const void			*obj)
-{
-	const xfs_agino_t		*key = arg->key;
-	const struct xfs_iunlink	*iu = obj;
-
-	if (iu->iu_next_unlinked != *key)
-		return 1;
-	return 0;
-}
-
-static const struct rhashtable_params xfs_iunlink_hash_params = {
-	.min_size		= XFS_AGI_UNLINKED_BUCKETS,
-	.key_len		= sizeof(xfs_agino_t),
-	.key_offset		= offsetof(struct xfs_iunlink,
-					   iu_next_unlinked),
-	.head_offset		= offsetof(struct xfs_iunlink, iu_rhash_head),
-	.automatic_shrinking	= true,
-	.obj_cmpfn		= xfs_iunlink_obj_cmpfn,
-};
-
-/*
- * Return X, where X.next_unlinked == @agino.  Returns NULLAGINO if no such
- * relation is found.
- */
-static xfs_agino_t
-xfs_iunlink_lookup_backref(
+static struct xfs_inode *
+xfs_iunlink_ilookup(
 	struct xfs_perag	*pag,
 	xfs_agino_t		agino)
 {
-	struct xfs_iunlink	*iu;
+	struct xfs_mount	*mp = pag->pag_mount;
+	struct xfs_inode	*ip;
 
-	iu = rhashtable_lookup_fast(&pag->pagi_unlinked_hash, &agino,
-			xfs_iunlink_hash_params);
-	return iu ? iu->iu_agino : NULLAGINO;
-}
+	rcu_read_lock();
+	ip = radix_tree_lookup(&pag->pag_ici_root, agino);
 
-/*
- * Take ownership of an iunlink cache entry and insert it into the hash table.
- * If successful, the entry will be owned by the cache; if not, it is freed.
- * Either way, the caller does not own @iu after this call.
- */
-static int
-xfs_iunlink_insert_backref(
-	struct xfs_perag	*pag,
-	struct xfs_iunlink	*iu)
-{
-	int			error;
-
-	error = rhashtable_insert_fast(&pag->pagi_unlinked_hash,
-			&iu->iu_rhash_head, xfs_iunlink_hash_params);
-	/*
-	 * Fail loudly if there already was an entry because that's a sign of
-	 * corruption of in-memory data.  Also fail loudly if we see an error
-	 * code we didn't anticipate from the rhashtable code.  Currently we
-	 * only anticipate ENOMEM.
-	 */
-	if (error) {
-		WARN(error != -ENOMEM, "iunlink cache insert error %d", error);
-		kmem_free(iu);
+	/* Inode not in memory, nothing to do */
+	if (!ip) {
+		rcu_read_unlock();
+		return NULL;
 	}
-	/*
-	 * Absorb any runtime errors that aren't a result of corruption because
-	 * this is a cache and we can always fall back to bucket list scanning.
-	 */
-	if (error != 0 && error != -EEXIST)
-		error = 0;
-	return error;
-}
-
-/* Remember that @prev_agino.next_unlinked = @this_agino. */
-static int
-xfs_iunlink_add_backref(
-	struct xfs_perag	*pag,
-	xfs_agino_t		prev_agino,
-	xfs_agino_t		this_agino)
-{
-	struct xfs_iunlink	*iu;
-
-	if (XFS_TEST_ERROR(false, pag->pag_mount, XFS_ERRTAG_IUNLINK_FALLBACK))
-		return 0;
-
-	iu = kmem_zalloc(sizeof(*iu), KM_NOFS);
-	iu->iu_agino = prev_agino;
-	iu->iu_next_unlinked = this_agino;
-
-	return xfs_iunlink_insert_backref(pag, iu);
+	spin_lock(&ip->i_flags_lock);
+	if (ip->i_ino != XFS_AGINO_TO_INO(mp, pag->pag_agno, agino) ||
+	    __xfs_iflags_test(ip, XFS_IRECLAIM)) {
+		/* Uh-oh! */
+		ip = NULL;
+	}
+	spin_unlock(&ip->i_flags_lock);
+	rcu_read_unlock();
+	return ip;
 }
 
 /*
- * Replace X.next_unlinked = @agino with X.next_unlinked = @next_unlinked.
- * If @next_unlinked is NULLAGINO, we drop the backref and exit.  If there
- * wasn't any such entry then we don't bother.
+ * Return the inode before @ip on the unlinked list without taking a reference
+ * to it. Caller must hold the AGI buffer locked to guarantee existence of the
+ * inode. Returns the inode or NULL if at the head of the list.
+ * If a lookup fails, return corruption error.
  */
-static int
-xfs_iunlink_change_backref(
+static struct xfs_inode *
+xfs_iunlink_lookup_prev(
 	struct xfs_perag	*pag,
-	xfs_agino_t		agino,
-	xfs_agino_t		next_unlinked)
+	struct xfs_inode	*ip)
 {
-	struct xfs_iunlink	*iu;
+	struct xfs_inode	*prev_ip;
+
+	if (ip->i_prev_unlinked == NULLAGINO)
+		return NULL;
+	prev_ip = xfs_iunlink_ilookup(pag, ip->i_prev_unlinked);
+	if (!prev_ip)
+		return ERR_PTR(-EFSCORRUPTED);
+	return prev_ip;
+}
+
+static struct xfs_inode *
+xfs_iunlink_lookup_next(
+	struct xfs_perag	*pag,
+	struct xfs_inode	*ip)
+{
+	struct xfs_inode	*next_ip;
+
+	if (ip->i_next_unlinked == NULLAGINO)
+		return NULL;
+	next_ip = xfs_iunlink_ilookup(pag, ip->i_next_unlinked);
+	if (!next_ip)
+		return ERR_PTR(-EFSCORRUPTED);
+	return next_ip;
+}
+
+/* Set an on-disk inode's next_unlinked pointer. */
+STATIC void
+xfs_iunlink_update_dinode(
+	struct xfs_trans	*tp,
+	xfs_agnumber_t		agno,
+	xfs_agino_t		agino,
+	struct xfs_buf		*ibp,
+	struct xfs_dinode	*dip,
+	struct xfs_imap		*imap,
+	xfs_agino_t		next_agino)
+{
+	struct xfs_mount	*mp = tp->t_mountp;
+	int			offset;
+
+	ASSERT(xfs_verify_agino_or_null(mp, agno, next_agino));
+
+	trace_xfs_iunlink_update_dinode(mp, agno, agino,
+			be32_to_cpu(dip->di_next_unlinked), next_agino);
+
+	dip->di_next_unlinked = cpu_to_be32(next_agino);
+	offset = imap->im_boffset +
+			offsetof(struct xfs_dinode, di_next_unlinked);
+
+	/* need to recalc the inode CRC if appropriate */
+	xfs_dinode_calc_crc(mp, dip);
+	xfs_trans_inode_buf(tp, ibp);
+	xfs_trans_log_buf(tp, ibp, offset, offset + sizeof(xfs_agino_t) - 1);
+}
+
+/* Set an in-core inode's unlinked pointer and return the old value. */
+static int
+xfs_iunlink_update_inode(
+	struct xfs_trans	*tp,
+	struct xfs_inode	*ip)
+{
+	struct xfs_mount	*mp = tp->t_mountp;
+	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
+	struct xfs_dinode	*dip;
+	struct xfs_buf		*ibp;
 	int			error;
 
-	/* Look up the old entry; if there wasn't one then exit. */
-	iu = rhashtable_lookup_fast(&pag->pagi_unlinked_hash, &agino,
-			xfs_iunlink_hash_params);
-	if (!iu)
-		return 0;
-
-	/*
-	 * Remove the entry.  This shouldn't ever return an error, but if we
-	 * couldn't remove the old entry we don't want to add it again to the
-	 * hash table, and if the entry disappeared on us then someone's
-	 * violated the locking rules and we need to fail loudly.  Either way
-	 * we cannot remove the inode because internal state is or would have
-	 * been corrupt.
-	 */
-	error = rhashtable_remove_fast(&pag->pagi_unlinked_hash,
-			&iu->iu_rhash_head, xfs_iunlink_hash_params);
+	error = xfs_imap_to_bp(mp, tp, &ip->i_imap, &dip, &ibp, 0);
 	if (error)
 		return error;
 
-	/* If there is no new next entry just free our item and return. */
-	if (next_unlinked == NULLAGINO) {
-		kmem_free(iu);
-		return 0;
-	}
-
-	/* Update the entry and re-add it to the hash table. */
-	iu->iu_next_unlinked = next_unlinked;
-	return xfs_iunlink_insert_backref(pag, iu);
-}
-
-/* Set up the in-core predecessor structures. */
-int
-xfs_iunlink_init(
-	struct xfs_perag	*pag)
-{
-	return rhashtable_init(&pag->pagi_unlinked_hash,
-			&xfs_iunlink_hash_params);
-}
-
-/* Free the in-core predecessor structures. */
-static void
-xfs_iunlink_free_item(
-	void			*ptr,
-	void			*arg)
-{
-	struct xfs_iunlink	*iu = ptr;
-	bool			*freed_anything = arg;
-
-	*freed_anything = true;
-	kmem_free(iu);
-}
-
-void
-xfs_iunlink_destroy(
-	struct xfs_perag	*pag)
-{
-	bool			freed_anything = false;
-
-	rhashtable_free_and_destroy(&pag->pagi_unlinked_hash,
-			xfs_iunlink_free_item, &freed_anything);
-
-	ASSERT(freed_anything == false || XFS_FORCED_SHUTDOWN(pag->pag_mount));
+	xfs_iunlink_update_dinode(tp, agno, XFS_INO_TO_AGINO(mp, ip->i_ino),
+			ibp, dip, &ip->i_imap, ip->i_next_unlinked);
+	return 0;
 }
 
 /*
@@ -2122,87 +2034,138 @@ xfs_iunlink_update_bucket(
 	return 0;
 }
 
-/* Set an on-disk inode's next_unlinked pointer. */
-STATIC void
-xfs_iunlink_update_dinode(
+/*
+ * Always insert at the head, so we only have to do a next inode lookup to
+ * update it's prev pointer. The AGI bucket will point at the one we are
+ * inserting.
+ */
+static int
+xfs_iunlink_insert_inode(
 	struct xfs_trans	*tp,
-	xfs_agnumber_t		agno,
-	xfs_agino_t		agino,
-	struct xfs_buf		*ibp,
-	struct xfs_dinode	*dip,
-	struct xfs_imap		*imap,
-	xfs_agino_t		next_agino)
+	struct xfs_buf		*agibp,
+	struct xfs_inode	*ip)
 {
 	struct xfs_mount	*mp = tp->t_mountp;
-	int			offset;
-
-	ASSERT(xfs_verify_agino_or_null(mp, agno, next_agino));
-
-	trace_xfs_iunlink_update_dinode(mp, agno, agino,
-			be32_to_cpu(dip->di_next_unlinked), next_agino);
-
-	dip->di_next_unlinked = cpu_to_be32(next_agino);
-	offset = imap->im_boffset +
-			offsetof(struct xfs_dinode, di_next_unlinked);
-
-	/* need to recalc the inode CRC if appropriate */
-	xfs_dinode_calc_crc(mp, dip);
-	xfs_trans_inode_buf(tp, ibp);
-	xfs_trans_log_buf(tp, ibp, offset, offset + sizeof(xfs_agino_t) - 1);
-}
-
-/* Set an in-core inode's unlinked pointer and return the old value. */
-STATIC int
-xfs_iunlink_update_inode(
-	struct xfs_trans	*tp,
-	struct xfs_inode	*ip,
-	xfs_agnumber_t		agno,
-	xfs_agino_t		next_agino,
-	xfs_agino_t		*old_next_agino)
-{
-	struct xfs_mount	*mp = tp->t_mountp;
-	struct xfs_dinode	*dip;
-	struct xfs_buf		*ibp;
-	xfs_agino_t		old_value;
+	struct xfs_agi		*agi = agibp->b_addr;
+	xfs_agino_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
+	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
+	xfs_agino_t		next_agino;
+	short			bucket_index = agino % XFS_AGI_UNLINKED_BUCKETS;
 	int			error;
 
-	ASSERT(xfs_verify_agino_or_null(mp, agno, next_agino));
-
-	error = xfs_imap_to_bp(mp, tp, &ip->i_imap, &dip, &ibp, 0);
-	if (error)
-		return error;
-
-	/* Make sure the old pointer isn't garbage. */
-	old_value = be32_to_cpu(dip->di_next_unlinked);
-	if (!xfs_verify_agino_or_null(mp, agno, old_value)) {
-		xfs_inode_verifier_error(ip, -EFSCORRUPTED, __func__, dip,
-				sizeof(*dip), __this_address);
-		error = -EFSCORRUPTED;
-		goto out;
-	}
-
 	/*
-	 * Since we're updating a linked list, we should never find that the
-	 * current pointer is the same as the new value, unless we're
-	 * terminating the list.
+	 * Get the index into the agi hash table for the list this inode will
+	 * go on.  Make sure the pointer isn't garbage and that this inode
+	 * isn't already on the list.
 	 */
-	*old_next_agino = old_value;
-	if (old_value == next_agino) {
-		if (next_agino != NULLAGINO) {
-			xfs_inode_verifier_error(ip, -EFSCORRUPTED, __func__,
-					dip, sizeof(*dip), __this_address);
-			error = -EFSCORRUPTED;
-		}
-		goto out;
+	next_agino = be32_to_cpu(agi->agi_unlinked[bucket_index]);
+	if (next_agino == agino ||
+	    !xfs_verify_agino_or_null(mp, agno, next_agino)) {
+		xfs_buf_mark_corrupt(agibp);
+		return -EFSCORRUPTED;
 	}
 
-	/* Ok, update the new pointer. */
-	xfs_iunlink_update_dinode(tp, agno, XFS_INO_TO_AGINO(mp, ip->i_ino),
-			ibp, dip, &ip->i_imap, next_agino);
-	return 0;
-out:
-	xfs_trans_brelse(tp, ibp);
-	return error;
+	ip->i_prev_unlinked = NULLAGINO;
+	ip->i_next_unlinked = next_agino;
+	if (ip->i_next_unlinked != NULLAGINO) {
+		struct xfs_inode	*nip;
+
+		nip = xfs_iunlink_lookup_next(agibp->b_pag, ip);
+		if (IS_ERR_OR_NULL(nip))
+			return -EFSCORRUPTED;
+
+		if (nip->i_prev_unlinked != NULLAGINO) {
+			xfs_inode_verifier_error(ip, -EFSCORRUPTED, __func__,
+						NULL, 0, __this_address);
+			return -EFSCORRUPTED;
+		}
+		nip->i_prev_unlinked = agino;
+
+		/* update the on disk inode now */
+		error = xfs_iunlink_update_inode(tp, ip);
+		if (error)
+			return error;
+	}
+
+	/* Point the head of the list to point to this inode. */
+	return xfs_iunlink_update_bucket(tp, agno, agibp, bucket_index, agino);
+}
+
+/*
+ * Remove can be from anywhere in the list, so we have to do two adjacent inode
+ * lookups here so we can update list pointers. We may be at the head or the
+ * tail of the list, so we have to handle those cases as well.
+ */
+static int
+xfs_iunlink_remove_inode(
+	struct xfs_trans	*tp,
+	struct xfs_buf		*agibp,
+	struct xfs_inode	*ip)
+{
+	struct xfs_mount	*mp = tp->t_mountp;
+	struct xfs_agi		*agi = agibp->b_addr;
+	xfs_agino_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
+	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
+	xfs_agino_t		next_agino = ip->i_next_unlinked;
+	short			bucket_index = agino % XFS_AGI_UNLINKED_BUCKETS;
+	int			error;
+
+	if (ip->i_prev_unlinked == NULLAGINO) {
+		/* remove from head of list */
+		if (be32_to_cpu(agi->agi_unlinked[bucket_index]) != agino) {
+			xfs_buf_mark_corrupt(agibp);
+			return -EFSCORRUPTED;
+		}
+		if (next_agino == agino ||
+		    !xfs_verify_agino_or_null(mp, agno, next_agino))
+			return -EFSCORRUPTED;
+
+		error = xfs_iunlink_update_bucket(tp, agno, agibp,
+					bucket_index, next_agino);
+		if (error)
+			return -EFSCORRUPTED;
+	} else {
+		/* lookup previous inode and update to point at next */
+		struct xfs_inode	*pip;
+
+		pip = xfs_iunlink_lookup_prev(agibp->b_pag, ip);
+		if (IS_ERR_OR_NULL(pip))
+			return -EFSCORRUPTED;
+
+		if (pip->i_next_unlinked != agino) {
+			xfs_inode_verifier_error(ip, -EFSCORRUPTED, __func__,
+						NULL, 0, __this_address);
+			return -EFSCORRUPTED;
+		}
+
+		/* update the on disk inode now */
+		pip->i_next_unlinked = next_agino;
+		error = xfs_iunlink_update_inode(tp, pip);
+		if (error)
+			return error;
+	}
+
+	/* lookup the next inode and update to point at prev */
+	if (ip->i_next_unlinked != NULLAGINO) {
+		struct xfs_inode	*nip;
+
+		nip = xfs_iunlink_lookup_next(agibp->b_pag, ip);
+		if (IS_ERR_OR_NULL(nip))
+			return -EFSCORRUPTED;
+
+		if (nip->i_prev_unlinked != agino) {
+			xfs_inode_verifier_error(ip, -EFSCORRUPTED, __func__,
+						NULL, 0, __this_address);
+			return -EFSCORRUPTED;
+		}
+		/* in memory update only */
+		nip->i_prev_unlinked = ip->i_prev_unlinked;
+	}
+
+	/* now clear prev/next from this inode and update on disk */
+	ip->i_prev_unlinked = NULLAGINO;
+	ip->i_next_unlinked = NULLAGINO;
+	return xfs_iunlink_update_inode(tp, ip);
 }
 
 /*
@@ -2218,12 +2181,8 @@ xfs_iunlink(
 	struct xfs_inode	*ip)
 {
 	struct xfs_mount	*mp = tp->t_mountp;
-	struct xfs_agi		*agi;
 	struct xfs_buf		*agibp;
-	xfs_agino_t		next_agino;
 	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
-	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
-	short			bucket_index = agino % XFS_AGI_UNLINKED_BUCKETS;
 	int			error;
 
 	ASSERT(VFS_I(ip)->i_nlink == 0);
@@ -2234,161 +2193,8 @@ xfs_iunlink(
 	error = xfs_read_agi(mp, tp, agno, &agibp);
 	if (error)
 		return error;
-	agi = agibp->b_addr;
 
-	/*
-	 * Get the index into the agi hash table for the list this inode will
-	 * go on.  Make sure the pointer isn't garbage and that this inode
-	 * isn't already on the list.
-	 */
-	next_agino = be32_to_cpu(agi->agi_unlinked[bucket_index]);
-	if (next_agino == agino ||
-	    !xfs_verify_agino_or_null(mp, agno, next_agino)) {
-		xfs_buf_mark_corrupt(agibp);
-		return -EFSCORRUPTED;
-	}
-
-	if (next_agino != NULLAGINO) {
-		struct xfs_perag	*pag;
-		xfs_agino_t		old_agino;
-
-		/*
-		 * There is already another inode in the bucket, so point this
-		 * inode to the current head of the list.
-		 */
-		error = xfs_iunlink_update_inode(tp, ip, agno, next_agino,
-				&old_agino);
-		if (error)
-			return error;
-		ASSERT(old_agino == NULLAGINO);
-
-		/*
-		 * agino has been unlinked, add a backref from the next inode
-		 * back to agino.
-		 */
-		pag = xfs_perag_get(mp, agno);
-		error = xfs_iunlink_add_backref(pag, agino, next_agino);
-		xfs_perag_put(pag);
-		if (error)
-			return error;
-	}
-
-	/* Point the head of the list to point to this inode. */
-	return xfs_iunlink_update_bucket(tp, agno, agibp, bucket_index, agino);
-}
-
-/* Return the imap, dinode pointer, and buffer for an inode. */
-STATIC int
-xfs_iunlink_map_ino(
-	struct xfs_trans	*tp,
-	xfs_agnumber_t		agno,
-	xfs_agino_t		agino,
-	struct xfs_imap		*imap,
-	struct xfs_dinode	**dipp,
-	struct xfs_buf		**bpp)
-{
-	struct xfs_mount	*mp = tp->t_mountp;
-	int			error;
-
-	imap->im_blkno = 0;
-	error = xfs_imap(mp, tp, XFS_AGINO_TO_INO(mp, agno, agino), imap, 0);
-	if (error) {
-		xfs_warn(mp, "%s: xfs_imap returned error %d.",
-				__func__, error);
-		return error;
-	}
-
-	error = xfs_imap_to_bp(mp, tp, imap, dipp, bpp, 0);
-	if (error) {
-		xfs_warn(mp, "%s: xfs_imap_to_bp returned error %d.",
-				__func__, error);
-		return error;
-	}
-
-	return 0;
-}
-
-/*
- * Walk the unlinked chain from @head_agino until we find the inode that
- * points to @target_agino.  Return the inode number, map, dinode pointer,
- * and inode cluster buffer of that inode as @agino, @imap, @dipp, and @bpp.
- *
- * @tp, @pag, @head_agino, and @target_agino are input parameters.
- * @agino, @imap, @dipp, and @bpp are all output parameters.
- *
- * Do not call this function if @target_agino is the head of the list.
- */
-STATIC int
-xfs_iunlink_map_prev(
-	struct xfs_trans	*tp,
-	xfs_agnumber_t		agno,
-	xfs_agino_t		head_agino,
-	xfs_agino_t		target_agino,
-	xfs_agino_t		*agino,
-	struct xfs_imap		*imap,
-	struct xfs_dinode	**dipp,
-	struct xfs_buf		**bpp,
-	struct xfs_perag	*pag)
-{
-	struct xfs_mount	*mp = tp->t_mountp;
-	xfs_agino_t		next_agino;
-	int			error;
-
-	ASSERT(head_agino != target_agino);
-	*bpp = NULL;
-
-	/* See if our backref cache can find it faster. */
-	*agino = xfs_iunlink_lookup_backref(pag, target_agino);
-	if (*agino != NULLAGINO) {
-		error = xfs_iunlink_map_ino(tp, agno, *agino, imap, dipp, bpp);
-		if (error)
-			return error;
-
-		if (be32_to_cpu((*dipp)->di_next_unlinked) == target_agino)
-			return 0;
-
-		/*
-		 * If we get here the cache contents were corrupt, so drop the
-		 * buffer and fall back to walking the bucket list.
-		 */
-		xfs_trans_brelse(tp, *bpp);
-		*bpp = NULL;
-		WARN_ON_ONCE(1);
-	}
-
-	trace_xfs_iunlink_map_prev_fallback(mp, agno);
-
-	/* Otherwise, walk the entire bucket until we find it. */
-	next_agino = head_agino;
-	while (next_agino != target_agino) {
-		xfs_agino_t	unlinked_agino;
-
-		if (*bpp)
-			xfs_trans_brelse(tp, *bpp);
-
-		*agino = next_agino;
-		error = xfs_iunlink_map_ino(tp, agno, next_agino, imap, dipp,
-				bpp);
-		if (error)
-			return error;
-
-		unlinked_agino = be32_to_cpu((*dipp)->di_next_unlinked);
-		/*
-		 * Make sure this pointer is valid and isn't an obvious
-		 * infinite loop.
-		 */
-		if (!xfs_verify_agino(mp, agno, unlinked_agino) ||
-		    next_agino == unlinked_agino) {
-			XFS_CORRUPTION_ERROR(__func__,
-					XFS_ERRLEVEL_LOW, mp,
-					*dipp, sizeof(**dipp));
-			error = -EFSCORRUPTED;
-			return error;
-		}
-		next_agino = unlinked_agino;
-	}
-
-	return 0;
+	return xfs_iunlink_insert_inode(tp, agibp, ip);
 }
 
 /*
@@ -2400,16 +2206,8 @@ xfs_iunlink_remove(
 	struct xfs_inode	*ip)
 {
 	struct xfs_mount	*mp = tp->t_mountp;
-	struct xfs_agi		*agi;
 	struct xfs_buf		*agibp;
-	struct xfs_buf		*last_ibp;
-	struct xfs_dinode	*last_dip = NULL;
-	struct xfs_perag	*pag = NULL;
 	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
-	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
-	xfs_agino_t		next_agino;
-	xfs_agino_t		head_agino;
-	short			bucket_index = agino % XFS_AGI_UNLINKED_BUCKETS;
 	int			error;
 
 	trace_xfs_iunlink_remove(ip);
@@ -2418,84 +2216,8 @@ xfs_iunlink_remove(
 	error = xfs_read_agi(mp, tp, agno, &agibp);
 	if (error)
 		return error;
-	agi = agibp->b_addr;
 
-	/*
-	 * Get the index into the agi hash table for the list this inode will
-	 * go on.  Make sure the head pointer isn't garbage.
-	 */
-	head_agino = be32_to_cpu(agi->agi_unlinked[bucket_index]);
-	if (!xfs_verify_agino(mp, agno, head_agino)) {
-		XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
-				agi, sizeof(*agi));
-		return -EFSCORRUPTED;
-	}
-
-	/*
-	 * Set our inode's next_unlinked pointer to NULL and then return
-	 * the old pointer value so that we can update whatever was previous
-	 * to us in the list to point to whatever was next in the list.
-	 */
-	error = xfs_iunlink_update_inode(tp, ip, agno, NULLAGINO, &next_agino);
-	if (error)
-		return error;
-
-	/*
-	 * If there was a backref pointing from the next inode back to this
-	 * one, remove it because we've removed this inode from the list.
-	 *
-	 * Later, if this inode was in the middle of the list we'll update
-	 * this inode's backref to point from the next inode.
-	 */
-	if (next_agino != NULLAGINO) {
-		pag = xfs_perag_get(mp, agno);
-		error = xfs_iunlink_change_backref(pag, next_agino,
-				NULLAGINO);
-		if (error)
-			goto out;
-	}
-
-	if (head_agino == agino) {
-		/* Point the head of the list to the next unlinked inode. */
-		error = xfs_iunlink_update_bucket(tp, agno, agibp, bucket_index,
-				next_agino);
-		if (error)
-			goto out;
-	} else {
-		struct xfs_imap	imap;
-		xfs_agino_t	prev_agino;
-
-		if (!pag)
-			pag = xfs_perag_get(mp, agno);
-
-		/* We need to search the list for the inode being freed. */
-		error = xfs_iunlink_map_prev(tp, agno, head_agino, agino,
-				&prev_agino, &imap, &last_dip, &last_ibp,
-				pag);
-		if (error)
-			goto out;
-
-		/* Point the previous inode on the list to the next inode. */
-		xfs_iunlink_update_dinode(tp, agno, prev_agino, last_ibp,
-				last_dip, &imap, next_agino);
-
-		/*
-		 * Now we deal with the backref for this inode.  If this inode
-		 * pointed at a real inode, change the backref that pointed to
-		 * us to point to our old next.  If this inode was the end of
-		 * the list, delete the backref that pointed to us.  Note that
-		 * change_backref takes care of deleting the backref if
-		 * next_agino is NULLAGINO.
-		 */
-		error = xfs_iunlink_change_backref(pag, agino, next_agino);
-		if (error)
-			goto out;
-	}
-
-out:
-	if (pag)
-		xfs_perag_put(pag);
-	return error;
+	return xfs_iunlink_remove_inode(tp, agibp, ip);
 }
 
 /*
