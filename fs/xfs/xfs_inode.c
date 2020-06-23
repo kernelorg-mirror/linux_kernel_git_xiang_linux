@@ -35,6 +35,7 @@
 #include "xfs_log.h"
 #include "xfs_bmap_btree.h"
 #include "xfs_reflink.h"
+#include "xfs_iunlink_item.h"
 
 kmem_zone_t *xfs_inode_zone;
 
@@ -1945,56 +1946,6 @@ xfs_iunlink_lookup_next(
 	return next_ip;
 }
 
-/* Set an on-disk inode's next_unlinked pointer. */
-STATIC void
-xfs_iunlink_update_dinode(
-	struct xfs_trans	*tp,
-	xfs_agnumber_t		agno,
-	xfs_agino_t		agino,
-	struct xfs_buf		*ibp,
-	struct xfs_dinode	*dip,
-	struct xfs_imap		*imap,
-	xfs_agino_t		next_agino)
-{
-	struct xfs_mount	*mp = tp->t_mountp;
-	int			offset;
-
-	ASSERT(xfs_verify_agino_or_null(mp, agno, next_agino));
-
-	trace_xfs_iunlink_update_dinode(mp, agno, agino,
-			be32_to_cpu(dip->di_next_unlinked), next_agino);
-
-	dip->di_next_unlinked = cpu_to_be32(next_agino);
-	offset = imap->im_boffset +
-			offsetof(struct xfs_dinode, di_next_unlinked);
-
-	/* need to recalc the inode CRC if appropriate */
-	xfs_dinode_calc_crc(mp, dip);
-	xfs_trans_inode_buf(tp, ibp);
-	xfs_trans_log_buf(tp, ibp, offset, offset + sizeof(xfs_agino_t) - 1);
-}
-
-/* Set an in-core inode's unlinked pointer and return the old value. */
-static int
-xfs_iunlink_update_inode(
-	struct xfs_trans	*tp,
-	struct xfs_inode	*ip)
-{
-	struct xfs_mount	*mp = tp->t_mountp;
-	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
-	struct xfs_dinode	*dip;
-	struct xfs_buf		*ibp;
-	int			error;
-
-	error = xfs_imap_to_bp(mp, tp, &ip->i_imap, &dip, &ibp, 0);
-	if (error)
-		return error;
-
-	xfs_iunlink_update_dinode(tp, agno, XFS_INO_TO_AGINO(mp, ip->i_ino),
-			ibp, dip, &ip->i_imap, ip->i_next_unlinked);
-	return 0;
-}
-
 /*
  * Point the AGI unlinked bucket at an inode and log the results.  The caller
  * is responsible for validating the old value.
@@ -2051,7 +2002,6 @@ xfs_iunlink_insert_inode(
 	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
 	xfs_agino_t		next_agino;
 	short			bucket_index = agino % XFS_AGI_UNLINKED_BUCKETS;
-	int			error;
 
 	/*
 	 * Get the index into the agi hash table for the list this inode will
@@ -2082,9 +2032,7 @@ xfs_iunlink_insert_inode(
 		nip->i_prev_unlinked = agino;
 
 		/* update the on disk inode now */
-		error = xfs_iunlink_update_inode(tp, ip);
-		if (error)
-			return error;
+		xfs_iunlink_log(tp, ip);
 	}
 
 	/* Point the head of the list to point to this inode. */
@@ -2140,9 +2088,7 @@ xfs_iunlink_remove_inode(
 
 		/* update the on disk inode now */
 		pip->i_next_unlinked = next_agino;
-		error = xfs_iunlink_update_inode(tp, pip);
-		if (error)
-			return error;
+		xfs_iunlink_log(tp, pip);
 	}
 
 	/* lookup the next inode and update to point at prev */
@@ -2162,10 +2108,15 @@ xfs_iunlink_remove_inode(
 		nip->i_prev_unlinked = ip->i_prev_unlinked;
 	}
 
-	/* now clear prev/next from this inode and update on disk */
+	/*
+	 * Now clear prev/next from this inode and update on disk if we
+	 * need to clear the on-disk link.
+	 */
 	ip->i_prev_unlinked = NULLAGINO;
 	ip->i_next_unlinked = NULLAGINO;
-	return xfs_iunlink_update_inode(tp, ip);
+	if (next_agino != NULLAGINO)
+		xfs_iunlink_log(tp, ip);
+	return 0;
 }
 
 /*
@@ -2185,6 +2136,7 @@ xfs_iunlink(
 	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
 	int			error;
 
+	ASSERT(ip->i_next_unlinked == NULLAGINO);
 	ASSERT(VFS_I(ip)->i_nlink == 0);
 	ASSERT(VFS_I(ip)->i_mode != 0);
 	trace_xfs_iunlink(ip);

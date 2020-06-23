@@ -488,8 +488,9 @@ xfs_inode_item_push(
 	ASSERT(iip->ili_item.li_buf);
 
 	if (xfs_ipincount(ip) > 0 || xfs_buf_ispinned(bp) ||
-	    (ip->i_flags & XFS_ISTALE))
+	    (ip->i_flags & XFS_ISTALE)) {
 		return XFS_ITEM_PINNED;
+	}
 
 	/* If the inode is already flush locked, we're already flushing. */
 	if (xfs_iflags_test(ip, XFS_IFLUSHING))
