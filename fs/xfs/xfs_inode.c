@@ -33,6 +33,7 @@
 #include "xfs_symlink.h"
 #include "xfs_trans_priv.h"
 #include "xfs_log.h"
+#include "xfs_log_priv.h"
 #include "xfs_bmap_btree.h"
 #include "xfs_reflink.h"
 #include "xfs_iunlink_item.h"
@@ -1955,25 +1956,32 @@ xfs_iunlink_update_bucket(
 	struct xfs_trans	*tp,
 	xfs_agnumber_t		agno,
 	struct xfs_buf		*agibp,
-	unsigned int		bucket_index,
+	xfs_agino_t		old_agino,
 	xfs_agino_t		new_agino)
 {
+	struct xlog		*log = tp->t_mountp->m_log;
 	struct xfs_agi		*agi = agibp->b_addr;
 	xfs_agino_t		old_value;
-	int			offset;
+	unsigned int		bucket_index;
+	int                     offset;
 
 	ASSERT(xfs_verify_agino_or_null(tp->t_mountp, agno, new_agino));
+
+	bucket_index = 0;
+	/* During recovery, the old multiple bucket index can be applied */
+	if (!log || log->l_flags & XLOG_RECOVERY_NEEDED) {
+		ASSERT(old_agino != NULLAGINO);
+
+		if (be32_to_cpu(agi->agi_unlinked[0]) != old_agino)
+			bucket_index = old_agino % XFS_AGI_UNLINKED_BUCKETS;
+	}
 
 	old_value = be32_to_cpu(agi->agi_unlinked[bucket_index]);
 	trace_xfs_iunlink_update_bucket(tp->t_mountp, agno, bucket_index,
 			old_value, new_agino);
 
-	/*
-	 * We should never find the head of the list already set to the value
-	 * passed in because either we're adding or removing ourselves from the
-	 * head of the list.
-	 */
-	if (old_value == new_agino) {
+	/* check if the old agi_unlinked head is as expected */
+	if (old_value != old_agino) {
 		xfs_buf_mark_corrupt(agibp);
 		return -EFSCORRUPTED;
 	}
@@ -2001,14 +2009,13 @@ xfs_iunlink_insert_inode(
 	xfs_agino_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
 	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
 	xfs_agino_t		next_agino;
-	short			bucket_index = agino % XFS_AGI_UNLINKED_BUCKETS;
 
 	/*
 	 * Get the index into the agi hash table for the list this inode will
 	 * go on.  Make sure the pointer isn't garbage and that this inode
 	 * isn't already on the list.
 	 */
-	next_agino = be32_to_cpu(agi->agi_unlinked[bucket_index]);
+	next_agino = be32_to_cpu(agi->agi_unlinked[0]);
 	if (next_agino == agino ||
 	    !xfs_verify_agino_or_null(mp, agno, next_agino)) {
 		xfs_buf_mark_corrupt(agibp);
@@ -2036,7 +2043,7 @@ xfs_iunlink_insert_inode(
 	}
 
 	/* Point the head of the list to point to this inode. */
-	return xfs_iunlink_update_bucket(tp, agno, agibp, bucket_index, agino);
+	return xfs_iunlink_update_bucket(tp, agno, agibp, next_agino, agino);
 }
 
 /*
@@ -2051,27 +2058,20 @@ xfs_iunlink_remove_inode(
 	struct xfs_inode	*ip)
 {
 	struct xfs_mount	*mp = tp->t_mountp;
-	struct xfs_agi		*agi = agibp->b_addr;
 	xfs_agino_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
 	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
 	xfs_agino_t		next_agino = ip->i_next_unlinked;
-	short			bucket_index = agino % XFS_AGI_UNLINKED_BUCKETS;
 	int			error;
 
 	if (ip->i_prev_unlinked == NULLAGINO) {
 		/* remove from head of list */
-		if (be32_to_cpu(agi->agi_unlinked[bucket_index]) != agino) {
-			xfs_buf_mark_corrupt(agibp);
-			return -EFSCORRUPTED;
-		}
 		if (next_agino == agino ||
 		    !xfs_verify_agino_or_null(mp, agno, next_agino))
 			return -EFSCORRUPTED;
 
-		error = xfs_iunlink_update_bucket(tp, agno, agibp,
-					bucket_index, next_agino);
+		error = xfs_iunlink_update_bucket(tp, agno, agibp, agino, next_agino);
 		if (error)
-			return -EFSCORRUPTED;
+			return error;
 	} else {
 		/* lookup previous inode and update to point at next */
 		struct xfs_inode	*pip;
