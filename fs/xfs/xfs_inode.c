@@ -33,6 +33,7 @@
 #include "xfs_symlink.h"
 #include "xfs_trans_priv.h"
 #include "xfs_log.h"
+#include "xfs_log_priv.h"
 #include "xfs_bmap_btree.h"
 #include "xfs_reflink.h"
 #include "xfs_iunlink_item.h"
@@ -2001,14 +2002,13 @@ xfs_iunlink_insert_inode(
 	xfs_agino_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
 	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
 	xfs_agino_t		next_agino;
-	short			bucket_index = agino % XFS_AGI_UNLINKED_BUCKETS;
 
 	/*
 	 * Get the index into the agi hash table for the list this inode will
 	 * go on.  Make sure the pointer isn't garbage and that this inode
 	 * isn't already on the list.
 	 */
-	next_agino = be32_to_cpu(agi->agi_unlinked[bucket_index]);
+	next_agino = be32_to_cpu(agi->agi_unlinked[0]);
 	if (next_agino == agino ||
 	    !xfs_verify_agino_or_null(mp, agno, next_agino)) {
 		xfs_buf_mark_corrupt(agibp);
@@ -2036,7 +2036,7 @@ xfs_iunlink_insert_inode(
 	}
 
 	/* Point the head of the list to point to this inode. */
-	return xfs_iunlink_update_bucket(tp, agno, agibp, bucket_index, agino);
+	return xfs_iunlink_update_bucket(tp, agno, agibp, 0, agino);
 }
 
 /*
@@ -2055,10 +2055,17 @@ xfs_iunlink_remove_inode(
 	xfs_agino_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
 	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
 	xfs_agino_t		next_agino = ip->i_next_unlinked;
-	short			bucket_index = agino % XFS_AGI_UNLINKED_BUCKETS;
 	int			error;
 
 	if (ip->i_prev_unlinked == NULLAGINO) {
+		struct xlog	*log = mp->m_log;
+		short		bucket_index = 0;
+
+		/* During recovery, the old multiple bucket can be applied */
+		if ((!log || log->l_flags & XLOG_RECOVERY_NEEDED) &&
+		    be32_to_cpu(agi->agi_unlinked[0]) != agino)
+			bucket_index = agino % XFS_AGI_UNLINKED_BUCKETS;
+
 		/* remove from head of list */
 		if (be32_to_cpu(agi->agi_unlinked[bucket_index]) != agino) {
 			xfs_buf_mark_corrupt(agibp);
