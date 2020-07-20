@@ -1987,56 +1987,85 @@ xfs_iunlink_update_bucket(
 }
 
 /*
+ * Lock the perag and take AGI lock if agi_unlinked is touched as well
+ * for xfs_iunlink_insert_inode(). As for the details of locking order,
+ * refer to the comments of xfs_iunlink_remove_lock().
+ */
+static struct xfs_perag *
+xfs_iunlink_insert_lock(
+	xfs_agino_t		agno,
+	struct xfs_trans        *tp,
+	struct xfs_inode	*ip,
+	struct xfs_buf		**agibpp)
+{
+	struct xfs_mount        *mp = tp->t_mountp;
+	struct xfs_perag	*pag;
+	int			error;
+
+	pag = xfs_perag_get(mp, agno);
+	mutex_lock(&pag->pag_unlinked_mutex);
+
+	if (!pag->pag_unlinked_tail) {
+		mutex_unlock(&pag->pag_unlinked_mutex);
+
+		error = xfs_read_agi(mp, tp, agno, agibpp);
+		if (error) {
+			xfs_perag_put(pag);
+			return ERR_PTR(error);
+		}
+		mutex_lock(&pag->pag_unlinked_mutex);
+	}
+	return pag;
+}
+
+/*
  * Always insert at the head, so we only have to do a next inode lookup to
  * update it's prev pointer. The AGI bucket will point at the one we are
  * inserting.
  */
 static int
 xfs_iunlink_insert_inode(
+	struct xfs_perag	*pag,
 	struct xfs_trans	*tp,
 	struct xfs_buf		*agibp,
 	struct xfs_inode	*ip)
 {
 	struct xfs_mount	*mp = tp->t_mountp;
-	struct xfs_agi		*agi = agibp->b_addr;
-	xfs_agino_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
+	struct xfs_inode	*pip = pag->pag_unlinked_tail;
 	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
 	xfs_agino_t		next_agino;
 
-	/*
-	 * Get the index into the agi hash table for the list this inode will
-	 * go on.  Make sure the pointer isn't garbage and that this inode
-	 * isn't already on the list.
-	 */
-	next_agino = be32_to_cpu(agi->agi_unlinked[0]);
-	if (next_agino == agino ||
-	    !xfs_verify_agino_or_null(mp, agno, next_agino)) {
-		xfs_buf_mark_corrupt(agibp);
-		return -EFSCORRUPTED;
-	}
+	if (!pip) {
+		xfs_agino_t	agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
+		struct xfs_agi	*agi = agibp->b_addr;
+		int		error;
 
-	ip->i_prev_unlinked = NULLAGINO;
-	ip->i_next_unlinked = next_agino;
-	if (ip->i_next_unlinked != NULLAGINO) {
-		struct xfs_inode	*nip;
-
-		nip = xfs_iunlink_lookup_next(agibp->b_pag, ip);
-		if (IS_ERR_OR_NULL(nip))
-			return -EFSCORRUPTED;
-
-		if (nip->i_prev_unlinked != NULLAGINO) {
-			xfs_inode_verifier_error(ip, -EFSCORRUPTED, __func__,
-						NULL, 0, __this_address);
+		ip->i_prev_unlinked = NULLAGINO;
+		/*
+		 * Get the index into the agi hash table for the list this
+		 * inode will go on.  Make sure the pointer isn't garbage
+		 * and that this inode isn't already on the list.
+		 */
+		next_agino = be32_to_cpu(agi->agi_unlinked[0]);
+		if (next_agino == agino ||
+		    !xfs_verify_agino_or_null(mp, agno, next_agino)) {
+			xfs_buf_mark_corrupt(agibp);
 			return -EFSCORRUPTED;
 		}
-		nip->i_prev_unlinked = agino;
 
-		/* update the on disk inode now */
-		xfs_iunlink_log(tp, ip);
+		/* Point the head of the list to point to this inode. */
+		error = xfs_iunlink_update_bucket(tp, agno, agibp, 0, agino);
+		if (error)
+			return error;
+	} else {
+		ip->i_prev_unlinked = XFS_INO_TO_AGINO(mp, pip->i_ino);
+		ASSERT(pip->i_next_unlinked == NULLAGINO);
+		pip->i_next_unlinked = agino;
+		xfs_iunlink_log(tp, pip);
 	}
-
-	/* Point the head of the list to point to this inode. */
-	return xfs_iunlink_update_bucket(tp, agno, agibp, 0, agino);
+	ip->i_next_unlinked = NULLAGINO;
+	pag->pag_unlinked_tail = ip;
+	return 0;
 }
 
 /*
@@ -2095,6 +2124,7 @@ xfs_iunlink_remove_inode(
 	xfs_agino_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
 	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
 	xfs_agino_t		next_agino = ip->i_next_unlinked;
+	struct xfs_inode	*pip = NULL;
 	int			error;
 
 	if (ip->i_prev_unlinked == NULLAGINO) {
@@ -2122,8 +2152,6 @@ xfs_iunlink_remove_inode(
 			return -EFSCORRUPTED;
 	} else {
 		/* lookup previous inode and update to point at next */
-		struct xfs_inode	*pip;
-
 		pip = xfs_iunlink_lookup_prev(pag, ip);
 		if (IS_ERR_OR_NULL(pip))
 			return -EFSCORRUPTED;
@@ -2139,8 +2167,12 @@ xfs_iunlink_remove_inode(
 		xfs_iunlink_log(tp, pip);
 	}
 
-	/* lookup the next inode and update to point at prev */
-	if (ip->i_next_unlinked != NULLAGINO) {
+	if (next_agino == NULLAGINO) {
+		/* only care about the tail of bucket 0 for xfs_iunlink() */
+		if (pag->pag_unlinked_tail == ip)
+			pag->pag_unlinked_tail = pip;
+	} else {
+		/* lookup the next inode and update to point at prev */
 		struct xfs_inode	*nip;
 
 		nip = xfs_iunlink_lookup_next(pag, ip);
@@ -2188,23 +2220,21 @@ xfs_iunlink(
 	struct xfs_trans	*tp,
 	struct xfs_inode	*ip)
 {
-	struct xfs_mount	*mp = tp->t_mountp;
-	struct xfs_buf		*agibp;
-	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
+	struct xfs_buf		*agibp = NULL;
+	struct xfs_perag	*pag;
 	int			error;
 
 	ASSERT(VFS_I(ip)->i_nlink == 0);
 	ASSERT(VFS_I(ip)->i_mode != 0);
 	trace_xfs_iunlink(ip);
 
-	/* Get the agi buffer first.  It ensures lock ordering on the list. */
-	error = xfs_read_agi(mp, tp, agno, &agibp);
-	if (error)
-		return error;
+	pag = xfs_iunlink_insert_lock(XFS_INO_TO_AGNO(tp->t_mountp, ip->i_ino),
+		tp, ip, &agibp);
+	if (IS_ERR(pag))
+		return PTR_ERR(pag);
 
-	mutex_lock(&agibp->b_pag->pag_unlinked_mutex);
-	error = xfs_iunlink_insert_inode(tp, agibp, ip);
-	mutex_unlock(&agibp->b_pag->pag_unlinked_mutex);
+	error = xfs_iunlink_insert_inode(pag, tp, agibp, ip);
+	xfs_iunlink_unlock(pag);
 	return error;
 }
 

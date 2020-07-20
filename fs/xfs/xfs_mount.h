@@ -375,6 +375,9 @@ typedef struct xfs_perag {
 	/* lock to protect unlinked inode list */
 	struct mutex            pag_unlinked_mutex;
 
+	/* point to the inode tail of AGI unlinked bucket 0 */
+	struct xfs_inode	*pag_unlinked_tail;
+
 	/*
 	 * Unlinked inode information.  This incore information reflects
 	 * data stored in the AGI, so callers must hold the AGI buffer lock
