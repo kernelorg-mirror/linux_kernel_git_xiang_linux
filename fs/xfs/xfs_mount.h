@@ -372,6 +372,15 @@ typedef struct xfs_perag {
 	/* reference count */
 	uint8_t			pagf_refcount_level;
 
+	/* lock to protect unlinked inode list and lockcount */
+	struct mutex            pag_iunlink_mutex;
+
+	/* recursive lock count of pag_iunlink_mutex */
+	unsigned int		pag_iunlink_lockcount;
+
+	/* (lockless) by which pag_iunlink_mutex is taken */
+	struct xfs_trans	*pag_iunlink_trans;
+
 	/*
 	 * Unlinked inode information.  This incore information reflects
 	 * data stored in the AGI, so callers must hold the AGI buffer lock

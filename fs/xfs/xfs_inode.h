@@ -467,4 +467,8 @@ extern struct kmem_zone	*xfs_inode_zone;
 
 void xfs_end_io(struct work_struct *work);
 
+void
+xfs_iunlink_unlock(
+	struct xfs_perag	*pag);
+
 #endif	/* __XFS_INODE_H__ */
