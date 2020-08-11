@@ -2801,6 +2801,11 @@ xlog_recover_iunlink_ag(
 					prev_ip->i_next_unlinked = NULLAGINO;
 				break;
 			}
+
+			/* XXX: take pag_unlinked_mutex across the loop? */
+			if (!bucket)
+				agibp->b_pag->pag_unlinked_tail = ip;
+
 			if (prev_ip) {
 				ip->i_prev_unlinked = prev_agino;
 				xfs_irele(prev_ip);

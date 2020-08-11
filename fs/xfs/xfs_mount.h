@@ -381,6 +381,9 @@ typedef struct xfs_perag {
 	/* (lockless) by which pag_iunlink_mutex is taken */
 	struct xfs_trans	*pag_iunlink_trans;
 
+	/* point to the inode tail of AGI unlinked bucket 0 */
+	struct xfs_inode	*pag_unlinked_tail;
+
 	/*
 	 * Unlinked inode information.  This incore information reflects
 	 * data stored in the AGI, so callers must hold the AGI buffer lock
