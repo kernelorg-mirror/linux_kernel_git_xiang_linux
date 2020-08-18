@@ -47,7 +47,7 @@ kmem_zone_t *xfs_inode_zone;
 #define	XFS_ITRUNC_MAX_EXTENTS	2
 
 STATIC int xfs_iunlink(struct xfs_trans *, struct xfs_inode *);
-STATIC int xfs_iunlink_remove(struct xfs_trans *, struct xfs_inode *);
+STATIC int xfs_iunlink_remove(struct xfs_trans *, struct xfs_inode *, bool);
 
 /*
  * helper function to extract extent size hint from inode
@@ -1398,7 +1398,7 @@ xfs_link(
 	 * Handle initial link state of O_TMPFILE inode
 	 */
 	if (VFS_I(sip)->i_nlink == 0) {
-		error = xfs_iunlink_remove(tp, sip);
+		error = xfs_iunlink_remove(tp, sip, false);
 		if (error)
 			goto error_return;
 	}
@@ -2001,6 +2001,18 @@ xfs_iunlink_insert_inode(
 	return xfs_iunlink_update_bucket(tp, agno, agibp, next_agino, agino);
 }
 
+void
+xfs_iunlink_unlock(
+	struct xfs_perag	*pag)
+{
+	/* Does not unlock AGI, ever. xfs_trans_commit() does that. */
+	if (!--pag->pag_iunlink_refcnt) {
+		smp_store_release(&pag->pag_iunlink_trans, NULL);
+		mutex_unlock(&pag->pag_iunlink_mutex);
+	}
+	xfs_perag_put(pag);
+}
+
 /*
  * This is called when the inode's link count has gone to 0 or we are creating
  * a tmpfile via O_TMPFILE.  The inode @ip must have nlink == 0.
@@ -2017,6 +2029,7 @@ xfs_iunlink(
 	struct xfs_buf		*agibp;
 	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
 	int			error;
+	struct xfs_perag	*pag;
 
 	ASSERT(VFS_I(ip)->i_nlink == 0);
 	ASSERT(VFS_I(ip)->i_mode != 0);
@@ -2026,6 +2039,14 @@ xfs_iunlink(
 	error = xfs_read_agi(mp, tp, agno, &agibp);
 	if (error)
 		return error;
+
+	/* XXX: will be shortly removed instead in the next commit. */
+	pag = xfs_perag_get(mp, agno);
+	/* paired with smp_store_release() in xfs_iunlink_unlock() */
+	if (smp_load_acquire(&pag->pag_iunlink_trans) != tp)
+		mutex_lock(&pag->pag_iunlink_mutex);
+	WRITE_ONCE(pag->pag_iunlink_trans, tp);
+	++pag->pag_iunlink_refcnt;
 
 	/*
 	 * Insert the inode into the on disk unlinked list, and if that
@@ -2037,11 +2058,72 @@ xfs_iunlink(
 	if (!error)
 		list_add(&ip->i_unlink, &agibp->b_pag->pag_ici_unlink_list);
 
+	xfs_iunlink_unlock(pag);
 	return error;
+}
+
+/*
+ * Lock the perag and take AGI lock if agi_unlinked is touched as well for
+ * xfs_iunlink_remove_inode().
+ *
+ * Inode allocation in the O_TMPFILE path defines the AGI/unlinked list lock
+ * order as being AGI->perag unlinked list lock. We are inverting it here as
+ * the fast path tail addition does not need to modify the AGI at all. Hence
+ * AGI lock is only needed if the head is modified, correct locking order.
+ */
+static struct xfs_perag *
+xfs_iunlink_remove_lock(
+	xfs_agino_t		agno,
+	struct xfs_trans        *tp,
+	struct xfs_inode	*ip,
+	struct xfs_buf		**agibpp,
+	bool			force_agi)
+{
+	struct xfs_mount        *mp = tp->t_mountp;
+	struct xfs_perag	*pag;
+	int			error;
+
+	pag = xfs_perag_get(mp, agno);
+	/* paired with smp_store_release() in xfs_iunlink_unlock() */
+	if (smp_load_acquire(&pag->pag_iunlink_trans) == tp) {
+		/*
+		 * if pag_iunlink_trans is the current trans, we're
+		 * in the current process context, so it's safe here.
+		 */
+		ASSERT(mutex_is_locked(&pag->pag_iunlink_mutex));
+		goto out;
+	}
+
+	if (!force_agi) {
+		mutex_lock(&pag->pag_iunlink_mutex);
+		if (ip != list_first_entry(&pag->pag_ici_unlink_list,
+				struct xfs_inode, i_unlink))
+			goto out;
+		mutex_unlock(&pag->pag_iunlink_mutex);
+	}
+
+	/*
+	 * some paths (e.g. xfs_create_tmpfile) could take AGI lock in
+	 * this transaction in advance and we should keep the proper
+	 * locking order: AGI buf lock and then pag_iunlink_mutex.
+	 */
+	error = xfs_read_agi(mp, tp, agno, agibpp);
+	if (error) {
+		xfs_perag_put(pag);
+		return ERR_PTR(error);
+	}
+
+	mutex_lock(&pag->pag_iunlink_mutex);
+	ASSERT(!pag->pag_iunlink_refcnt);
+out:
+	WRITE_ONCE(pag->pag_iunlink_trans, tp);
+	++pag->pag_iunlink_refcnt;
+	return pag;
 }
 
 static int
 xfs_iunlink_remove_inode(
+	struct xfs_perag	*pag,
 	struct xfs_trans	*tp,
 	struct xfs_buf		*agibp,
 	struct xfs_inode	*ip)
@@ -2055,7 +2137,7 @@ xfs_iunlink_remove_inode(
 	 * Get the next agino in the list. If we are at the end of the list,
 	 * then the previous inode's i_next_unlinked filed will get cleared.
 	 */
-	if (ip != list_last_entry(&agibp->b_pag->pag_ici_unlink_list,
+	if (ip != list_last_entry(&pag->pag_ici_unlink_list,
 					struct xfs_inode, i_unlink)) {
 		struct xfs_inode *nip = list_next_entry(ip, i_unlink);
 
@@ -2065,7 +2147,7 @@ xfs_iunlink_remove_inode(
 	/* Clear the on disk next unlinked pointer for this inode. */
 	xfs_iunlink_log(tp, ip, next_agino, NULLAGINO);
 
-	if (ip != list_first_entry(&agibp->b_pag->pag_ici_unlink_list,
+	if (ip != list_first_entry(&pag->pag_ici_unlink_list,
 					struct xfs_inode, i_unlink)) {
 		struct xfs_inode *pip = list_prev_entry(ip, i_unlink);
 
@@ -2073,6 +2155,7 @@ xfs_iunlink_remove_inode(
 		return 0;
 	}
 
+	ASSERT(agibp);
 	/* Point the head of the list to the next unlinked inode. */
 	return xfs_iunlink_update_bucket(tp, agno, agibp, agino, next_agino);
 }
@@ -2083,27 +2166,29 @@ xfs_iunlink_remove_inode(
 STATIC int
 xfs_iunlink_remove(
 	struct xfs_trans	*tp,
-	struct xfs_inode	*ip)
+	struct xfs_inode	*ip,
+	bool			force_agi)
 {
 	struct xfs_mount	*mp = tp->t_mountp;
-	struct xfs_buf		*agibp;
+	struct xfs_buf		*agibp = NULL;
 	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
+	struct xfs_perag	*pag;
 	int			error;
 
 	trace_xfs_iunlink_remove(ip);
 
-	/* Get the agi buffer first.  It ensures lock ordering on the list. */
-	error = xfs_read_agi(mp, tp, agno, &agibp);
-	if (error)
-		return error;
+	pag = xfs_iunlink_remove_lock(agno, tp, ip, &agibp, force_agi);
+	if (IS_ERR(pag))
+		return PTR_ERR(pag);
 
 	/*
 	 * Remove the inode from the on-disk list and then remove it from the
 	 * in-memory list. This order of operations ensures we can look up both
 	 * next and previous inode in the on-disk list via the in-memory list.
 	 */
-	error = xfs_iunlink_remove_inode(tp, agibp, ip);
+	error = xfs_iunlink_remove_inode(pag, tp, agibp, ip);
 	list_del(&ip->i_unlink);
+	xfs_iunlink_unlock(pag);
 	return error;
 }
 
@@ -2316,7 +2401,7 @@ xfs_ifree(
 	if (error)
 		return error;
 
-	error = xfs_iunlink_remove(tp, ip);
+	error = xfs_iunlink_remove(tp, ip, false);
 	if (error)
 		return error;
 
@@ -2895,7 +2980,7 @@ xfs_rename(
 	 */
 	if (wip) {
 		ASSERT(VFS_I(wip)->i_nlink == 0);
-		error = xfs_iunlink_remove(tp, wip);
+		error = xfs_iunlink_remove(tp, wip, true);
 		if (error)
 			goto out_trans_cancel;
 

@@ -16,6 +16,7 @@
 #include "xfs_iunlink_item.h"
 #include "xfs_trace.h"
 #include "xfs_error.h"
+#include "xfs_sb.h"
 
 struct kmem_cache	*xfs_iunlink_zone;
 
@@ -28,6 +29,13 @@ static void
 xfs_iunlink_item_release(
 	struct xfs_log_item	*lip)
 {
+	struct xfs_mount	*mp = lip->li_mountp;
+	struct xfs_inode        *ip = IUL_ITEM(lip)->iu_ip;
+	struct xfs_perag	*pag;
+
+	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ip->i_ino));
+	ASSERT(mutex_is_locked(&pag->pag_iunlink_mutex));
+	xfs_iunlink_unlock(pag);
 	kmem_cache_free(xfs_iunlink_zone, IUL_ITEM(lip));
 }
 
@@ -150,7 +158,9 @@ xfs_iunlink_log(
 	xfs_agino_t		old_agino,
 	xfs_agino_t		next_agino)
 {
+	struct xfs_mount        *mp = tp->t_mountp;
 	struct xfs_iunlink_item	*iup;
+	struct xfs_perag	*pag;
 
 	iup = kmem_cache_zalloc(xfs_iunlink_zone, GFP_KERNEL | __GFP_NOFAIL);
 
@@ -164,5 +174,11 @@ xfs_iunlink_log(
 	xfs_trans_add_item(tp, &iup->iu_item);
 	tp->t_flags |= XFS_TRANS_DIRTY;
 	set_bit(XFS_LI_DIRTY, &iup->iu_item.li_flags);
+
+	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ip->i_ino));
+	ASSERT(mutex_is_locked(&pag->pag_iunlink_mutex));
+	ASSERT(pag->pag_iunlink_trans == tp);
+	++pag->pag_iunlink_refcnt;
+	xfs_perag_put(pag);
 }
 

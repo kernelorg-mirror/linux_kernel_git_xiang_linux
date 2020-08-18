@@ -372,6 +372,15 @@ typedef struct xfs_perag {
 
 	/* reference count */
 	uint8_t			pagf_refcount_level;
+
+	/* lock to protect unlinked inode list and refcnt */
+	struct mutex            pag_iunlink_mutex;
+
+	/* recursive count of pag_iunlink_mutex */
+	unsigned int		pag_iunlink_refcnt;
+
+	/* (lockless) by which pag_iunlink_mutex is taken */
+	struct xfs_trans	*pag_iunlink_trans;
 } xfs_perag_t;
 
 static inline struct xfs_ag_resv *

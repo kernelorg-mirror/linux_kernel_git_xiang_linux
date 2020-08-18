@@ -224,6 +224,10 @@ xfs_initialize_perag(
 		if (first_initialised == NULLAGNUMBER)
 			first_initialised = index;
 		spin_lock_init(&pag->pag_state_lock);
+
+		mutex_init(&pag->pag_iunlink_mutex);
+		pag->pag_iunlink_refcnt = 0;
+		pag->pag_iunlink_trans = NULL;
 	}
 
 	index = xfs_set_inode_alloc(mp, agcount);
