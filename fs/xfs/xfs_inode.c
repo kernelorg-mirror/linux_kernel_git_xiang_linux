@@ -1975,30 +1975,88 @@ xfs_iunlink_update_bucket(
 
 static int
 xfs_iunlink_insert_inode(
+	struct xfs_perag	*pag,
 	struct xfs_trans	*tp,
 	struct xfs_buf		*agibp,
 	struct xfs_inode	*ip)
 {
 	struct xfs_mount	*mp = tp->t_mountp;
-	struct xfs_inode	*nip;
-	xfs_agino_t		next_agino = NULLAGINO;
 	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
 	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
 
-	nip = list_first_entry_or_null(&agibp->b_pag->pag_ici_unlink_list,
-					struct xfs_inode, i_unlink);
-	if (nip) {
+	if (!list_empty(&pag->pag_ici_unlink_list)) {
+		struct xfs_inode	*pip;
 
 		/*
-		 * There is already another inode in the bucket, so point this
-		 * inode to the current head of the list.
+		 * There is already another inode in the bucket, so point
+		 * the last inode to this inode.
 		 */
-		next_agino = XFS_INO_TO_AGINO(mp, nip->i_ino);
-		xfs_iunlink_log(tp, ip, NULLAGINO, next_agino);
+		pip = list_last_entry(&pag->pag_ici_unlink_list,
+				struct xfs_inode, i_unlink);
+		xfs_iunlink_log(tp, pip, NULLAGINO, agino);
+		return 0;
 	}
 
+	ASSERT(agibp);
 	/* Point the head of the list to point to this inode. */
-	return xfs_iunlink_update_bucket(tp, agno, agibp, next_agino, agino);
+	return xfs_iunlink_update_bucket(tp, agno, agibp, NULLAGINO, agino);
+}
+
+/*
+ * Lock the perag and take AGI lock if agi_unlinked is touched as well
+ * for xfs_iunlink_insert_inode(). As for the details of locking order,
+ * refer to the comments of xfs_iunlink_remove_lock().
+ */
+static struct xfs_perag *
+xfs_iunlink_insert_lock(
+	xfs_agino_t		agno,
+	struct xfs_trans        *tp,
+	struct xfs_inode	*ip,
+	struct xfs_buf		**agibpp)
+{
+	struct xfs_mount        *mp = tp->t_mountp;
+	bool			locked = true;
+	struct xfs_perag	*pag;
+	int			error;
+
+	pag = xfs_perag_get(mp, agno);
+	/* paired with smp_store_release() in xfs_iunlink_unlock() */
+	if (smp_load_acquire(&pag->pag_iunlink_trans) == tp) {
+		/*
+		 * if pag_iunlink_trans is the current trans, we're
+		 * in the current process context, so it's safe here.
+		 */
+		ASSERT(mutex_is_locked(&pag->pag_iunlink_mutex));
+		/*
+		 * slightly different from xfs_iunlink_remove_lock(),
+		 * the path of xfs_iunlink_remove() and then xfs_iunlink()
+		 * on the same AG needs to be considered (e.g. whiteout
+		 * rename), so lock AGI first in xfs_iunlink_remove(),
+		 * and recursively get AGI safely below.
+		 */
+		if (!list_empty(&pag->pag_ici_unlink_list))
+			goto out;
+	} else {
+		mutex_lock(&pag->pag_iunlink_mutex);
+		if (!list_empty(&pag->pag_ici_unlink_list))
+			goto out;
+		mutex_unlock(&pag->pag_iunlink_mutex);
+		locked = false;
+	}
+
+	/* and see comments in xfs_iunlink_remove_lock() on locking order */
+	error = xfs_read_agi(mp, tp, agno, agibpp);
+	if (error) {
+		xfs_perag_put(pag);
+		return ERR_PTR(error);
+	}
+
+	if (!locked)
+		mutex_lock(&pag->pag_iunlink_mutex);
+out:
+	WRITE_ONCE(pag->pag_iunlink_trans, tp);
+	++pag->pag_iunlink_refcnt;
+	return pag;
 }
 
 void
@@ -2026,7 +2084,7 @@ xfs_iunlink(
 	struct xfs_inode	*ip)
 {
 	struct xfs_mount	*mp = tp->t_mountp;
-	struct xfs_buf		*agibp;
+	struct xfs_buf		*agibp = NULL;
 	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
 	int			error;
 	struct xfs_perag	*pag;
@@ -2035,18 +2093,9 @@ xfs_iunlink(
 	ASSERT(VFS_I(ip)->i_mode != 0);
 	trace_xfs_iunlink(ip);
 
-	/* Get the agi buffer first.  It ensures lock ordering on the list. */
-	error = xfs_read_agi(mp, tp, agno, &agibp);
-	if (error)
-		return error;
-
-	/* XXX: will be shortly removed instead in the next commit. */
-	pag = xfs_perag_get(mp, agno);
-	/* paired with smp_store_release() in xfs_iunlink_unlock() */
-	if (smp_load_acquire(&pag->pag_iunlink_trans) != tp)
-		mutex_lock(&pag->pag_iunlink_mutex);
-	WRITE_ONCE(pag->pag_iunlink_trans, tp);
-	++pag->pag_iunlink_refcnt;
+	pag = xfs_iunlink_insert_lock(agno, tp, ip, &agibp);
+	if (IS_ERR(pag))
+		return PTR_ERR(pag);
 
 	/*
 	 * Insert the inode into the on disk unlinked list, and if that
@@ -2054,9 +2103,9 @@ xfs_iunlink(
 	 * order so that the modifications required to the on disk list are not
 	 * impacted by already having this inode in the list.
 	 */
-	error = xfs_iunlink_insert_inode(tp, agibp, ip);
+	error = xfs_iunlink_insert_inode(pag, tp, agibp, ip);
 	if (!error)
-		list_add(&ip->i_unlink, &agibp->b_pag->pag_ici_unlink_list);
+		list_add_tail(&ip->i_unlink, &pag->pag_ici_unlink_list);
 
 	xfs_iunlink_unlock(pag);
 	return error;
