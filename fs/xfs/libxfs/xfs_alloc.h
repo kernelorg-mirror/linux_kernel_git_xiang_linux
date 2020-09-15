@@ -161,6 +161,16 @@ xfs_alloc_vextent(
 	xfs_alloc_arg_t	*args);	/* allocation argument structure */
 
 /*
+ * Allocate an extent for shrinking the last AG
+ */
+int
+xfs_alloc_vextent_shrink(
+	struct xfs_trans	*tp,
+	struct xfs_buf		*agbp,
+	xfs_agblock_t		agbno,
+	xfs_extlen_t		len);	/* length of extent */
+
+/*
  * Free an extent.
  */
 int				/* error */

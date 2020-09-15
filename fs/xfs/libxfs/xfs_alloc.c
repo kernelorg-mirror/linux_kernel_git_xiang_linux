@@ -1119,6 +1119,61 @@ error:
 }
 
 /*
+ * Allocate an extent for shrinking the last allocation group
+ * to fix the freespace btree.
+ * agfl fix is avoided in order to keep from dirtying the
+ * transaction unnecessarily compared with xfs_alloc_vextent().
+ */
+int
+xfs_alloc_vextent_shrink(
+	struct xfs_trans	*tp,
+	struct xfs_buf		*agbp,
+	xfs_agblock_t		agbno,
+	xfs_extlen_t		len)
+{
+	struct xfs_mount	*mp = tp->t_mountp;
+	xfs_agnumber_t		agno = agbp->b_pag->pag_agno;
+	struct xfs_alloc_arg	args = {
+		.tp = tp,
+		.mp = mp,
+		.type = XFS_ALLOCTYPE_THIS_BNO,
+		.agbp = agbp,
+		.agno = agno,
+		.agbno = agbno,
+		.fsbno = XFS_AGB_TO_FSB(mp, agno, agbno),
+		.minlen = len,
+		.maxlen = len,
+		.oinfo = XFS_RMAP_OINFO_SKIP_UPDATE,
+		.resv = XFS_AG_RESV_NONE,
+		.prod = 1,
+		.alignment = 1,
+		.pag = agbp->b_pag
+	};
+	int			error;
+
+	error = xfs_alloc_ag_vextent_exact(&args);
+	if (error || args.agbno == NULLAGBLOCK)
+		return -EBUSY;
+
+	ASSERT(args.agbno == agbno);
+	ASSERT(args.len == len);
+	ASSERT(!args.wasfromfl || args.resv != XFS_AG_RESV_AGFL);
+
+	if (!args.wasfromfl) {
+		error = xfs_alloc_update_counters(tp, agbp, -(long)len);
+		if (error)
+			return error;
+
+		ASSERT(!xfs_extent_busy_search(mp, args.agno, agbno, args.len));
+	}
+	xfs_ag_resv_alloc_extent(args.pag, args.resv, &args);
+
+	XFS_STATS_INC(mp, xs_allocx);
+	XFS_STATS_ADD(mp, xs_allocb, args.len);
+	return 0;
+}
+
+/*
  * Allocate a variable extent in the allocation group agno.
  * Type and bno are used to determine where in the allocation group the
  * extent will start.

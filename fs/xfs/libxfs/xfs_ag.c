@@ -485,6 +485,52 @@ xfs_ag_init_headers(
 	return error;
 }
 
+int
+xfs_ag_shrink_space(
+	struct xfs_mount	*mp,
+	struct xfs_trans	*tp,
+	struct aghdr_init_data	*id,
+	xfs_extlen_t		len)
+{
+	struct xfs_buf		*agibp, *agfbp;
+	struct xfs_agi		*agi;
+	struct xfs_agf		*agf;
+	int			error;
+
+	ASSERT(id->agno == mp->m_sb.sb_agcount - 1);
+	error = xfs_ialloc_read_agi(mp, tp, id->agno, &agibp);
+	if (error)
+		return error;
+
+	agi = agibp->b_addr;
+
+	/* Cannot touch the log space */
+	if (is_log_ag(mp, id) &&
+	    XFS_FSB_TO_AGBNO(mp, mp->m_sb.sb_logstart) +
+	    mp->m_sb.sb_logblocks > be32_to_cpu(agi->agi_length) - len)
+		return -EINVAL;
+
+	error = xfs_alloc_read_agf(mp, tp, id->agno, 0, &agfbp);
+	if (error)
+		return error;
+
+	error = xfs_alloc_vextent_shrink(tp, agfbp,
+			be32_to_cpu(agi->agi_length) - len, len);
+	if (error)
+		return error;
+
+	/* Change the agi length */
+	be32_add_cpu(&agi->agi_length, -len);
+	xfs_ialloc_log_agi(tp, agibp, XFS_AGI_LENGTH);
+
+	/* Change agf length */
+	agf = agfbp->b_addr;
+	be32_add_cpu(&agf->agf_length, -len);
+	ASSERT(agf->agf_length == agi->agi_length);
+	xfs_alloc_log_agf(tp, agfbp, XFS_AGF_LENGTH);
+	return 0;
+}
+
 /*
  * Extent the AG indicated by the @id by the length passed in
  */

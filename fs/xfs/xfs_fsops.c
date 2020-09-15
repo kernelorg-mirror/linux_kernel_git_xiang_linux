@@ -36,19 +36,21 @@ xfs_growfs_data_private(
 	xfs_rfsblock_t		new;
 	xfs_agnumber_t		oagcount;
 	xfs_trans_t		*tp;
+	bool			extend;
 	struct aghdr_init_data	id = {};
 
 	nb = in->newblocks;
-	if (nb < mp->m_sb.sb_dblocks)
-		return -EINVAL;
 	if ((error = xfs_sb_validate_fsb_count(&mp->m_sb, nb)))
 		return error;
-	error = xfs_buf_read_uncached(mp->m_ddev_targp,
+
+	if (nb > mp->m_sb.sb_dblocks) {
+		error = xfs_buf_read_uncached(mp->m_ddev_targp,
 				XFS_FSB_TO_BB(mp, nb) - XFS_FSS_TO_BB(mp, 1),
 				XFS_FSS_TO_BB(mp, 1), 0, &bp, NULL);
-	if (error)
-		return error;
-	xfs_buf_relse(bp);
+		if (error)
+			return error;
+		xfs_buf_relse(bp);
+	}
 
 	new = nb;	/* use new as a temporary here */
 	nb_mod = do_div(new, mp->m_sb.sb_agblocks);
@@ -56,10 +58,18 @@ xfs_growfs_data_private(
 	if (nb_mod && nb_mod < XFS_MIN_AG_BLOCKS) {
 		nagcount--;
 		nb = (xfs_rfsblock_t)nagcount * mp->m_sb.sb_agblocks;
-		if (nb < mp->m_sb.sb_dblocks)
+		if (!nagcount)
 			return -EINVAL;
 	}
-	new = nb - mp->m_sb.sb_dblocks;
+
+	if (nb > mp->m_sb.sb_dblocks) {
+		new = nb - mp->m_sb.sb_dblocks;
+		extend = true;
+	} else {
+		new = mp->m_sb.sb_dblocks - nb;
+		extend = false;
+	}
+
 	oagcount = mp->m_sb.sb_agcount;
 
 	/* allocate the new per-ag structures */
@@ -67,10 +77,14 @@ xfs_growfs_data_private(
 		error = xfs_initialize_perag(mp, nagcount, &nagimax);
 		if (error)
 			return error;
+	} else if (nagcount != oagcount) {
+		/* TODO: shrinking a whole AG hasn't yet implemented */
+		return -EINVAL;
 	}
 
 	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_growdata,
-			XFS_GROWFS_SPACE_RES(mp), 0, XFS_TRANS_RESERVE, &tp);
+			(extend ? 0 : new) + XFS_GROWFS_SPACE_RES(mp), 0,
+			XFS_TRANS_RESERVE, &tp);
 	if (error)
 		return error;
 
@@ -103,15 +117,22 @@ xfs_growfs_data_private(
 			goto out_trans_cancel;
 		}
 	}
-	error = xfs_buf_delwri_submit(&id.buffer_list);
-	if (error)
-		goto out_trans_cancel;
+
+	if (!list_empty(&id.buffer_list)) {
+		error = xfs_buf_delwri_submit(&id.buffer_list);
+		if (error)
+			goto out_trans_cancel;
+	}
 
 	xfs_trans_agblocks_delta(tp, id.nfree);
 
 	/* If there are new blocks in the old last AG, extend it. */
 	if (new) {
-		error = xfs_ag_extend_space(mp, tp, &id, new);
+		if (extend)
+			error = xfs_ag_extend_space(mp, tp, &id, new);
+		else
+			error = xfs_ag_shrink_space(mp, tp, &id, new);
+
 		if (error)
 			goto out_trans_cancel;
 	}
@@ -123,11 +144,19 @@ xfs_growfs_data_private(
 	 */
 	if (nagcount > oagcount)
 		xfs_trans_mod_sb(tp, XFS_TRANS_SB_AGCOUNT, nagcount - oagcount);
-	if (nb > mp->m_sb.sb_dblocks)
+	if (nb != mp->m_sb.sb_dblocks)
 		xfs_trans_mod_sb(tp, XFS_TRANS_SB_DBLOCKS,
 				 nb - mp->m_sb.sb_dblocks);
 	if (id.nfree)
 		xfs_trans_mod_sb(tp, XFS_TRANS_SB_FDBLOCKS, id.nfree);
+
+	/*
+	 * update in-core counters (especially sb_fdblocks) now
+	 * so xfs_validate_sb_write() can pass.
+	 */
+	if (xfs_sb_version_haslazysbcount(&mp->m_sb))
+		xfs_log_sb(tp);
+
 	xfs_trans_set_sync(tp);
 	error = xfs_trans_commit(tp);
 	if (error)
