@@ -22,6 +22,8 @@
 #include "xfs_ag.h"
 #include "xfs_ag_resv.h"
 #include "xfs_health.h"
+#include "xfs_error.h"
+#include "xfs_bmap.h"
 
 static int
 xfs_get_aghdr_buf(
@@ -483,6 +485,92 @@ xfs_ag_init_headers(
 			break;
 	}
 	return error;
+}
+
+int
+xfs_ag_shrink_space(
+	struct xfs_mount	*mp,
+	struct xfs_trans	*tp,
+	struct aghdr_init_data	*id,
+	xfs_extlen_t		len)
+{
+	struct xfs_alloc_arg	args = {
+		.tp	= tp,
+		.mp	= mp,
+		.type	= XFS_ALLOCTYPE_THIS_BNO,
+		.minlen = len,
+		.maxlen = len,
+		.oinfo	= XFS_RMAP_OINFO_SKIP_UPDATE,
+		.resv	= XFS_AG_RESV_NONE,
+		.prod	= 1
+	};
+	struct xfs_buf		*agibp, *agfbp;
+	struct xfs_agi		*agi;
+	struct xfs_agf		*agf;
+	int			error, err2;
+
+	ASSERT(id->agno == mp->m_sb.sb_agcount - 1);
+	error = xfs_ialloc_read_agi(mp, tp, id->agno, &agibp);
+	if (error)
+		return error;
+
+	agi = agibp->b_addr;
+
+	error = xfs_alloc_read_agf(mp, tp, id->agno, 0, &agfbp);
+	if (error)
+		return error;
+
+	agf = agfbp->b_addr;
+	if (XFS_IS_CORRUPT(mp, agf->agf_length != agi->agi_length))
+		return -EFSCORRUPTED;
+
+	args.fsbno = XFS_AGB_TO_FSB(mp, id->agno,
+				    be32_to_cpu(agi->agi_length) - len);
+
+	/* remove the preallocations before allocation and re-establish then */
+	error = xfs_ag_resv_free(agibp->b_pag);
+	if (error)
+		return error;
+
+	/* internal log shouldn't also show up in the free space btrees */
+	error = xfs_alloc_vextent(&args);
+	if (!error && args.agbno == NULLAGBLOCK)
+		error = -ENOSPC;
+
+	if (error) {
+		err2 = xfs_ag_resv_init(agibp->b_pag, tp);
+		if (err2)
+			goto resv_err;
+		return error;
+	}
+
+	/*
+	 * if successfully deleted from freespace btrees, need to confirm
+	 * per-AG reservation works as expected.
+	 */
+	be32_add_cpu(&agi->agi_length, -len);
+	be32_add_cpu(&agf->agf_length, -len);
+
+	err2 = xfs_ag_resv_init(agibp->b_pag, tp);
+	if (err2) {
+		be32_add_cpu(&agi->agi_length, len);
+		be32_add_cpu(&agf->agf_length, len);
+		if (err2 != -ENOSPC)
+			goto resv_err;
+
+		__xfs_bmap_add_free(tp, args.fsbno, len,
+				    &XFS_RMAP_OINFO_SKIP_UPDATE, true);
+		return err2;
+	}
+	xfs_ialloc_log_agi(tp, agibp, XFS_AGI_LENGTH);
+	xfs_alloc_log_agf(tp, agfbp, XFS_AGF_LENGTH);
+	return 0;
+
+resv_err:
+	xfs_warn(mp,
+"Error %d reserving per-AG metadata reserve pool.", err2);
+		xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
+	return err2;
 }
 
 /*
