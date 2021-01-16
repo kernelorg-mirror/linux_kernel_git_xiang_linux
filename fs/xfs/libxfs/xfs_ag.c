@@ -23,6 +23,7 @@
 #include "xfs_ag_resv.h"
 #include "xfs_health.h"
 #include "xfs_error.h"
+#include "xfs_errortag.h"
 #include "xfs_bmap.h"
 
 static int
@@ -552,6 +553,10 @@ xfs_ag_shrink_space(
 	be32_add_cpu(&agf->agf_length, -len);
 
 	err2 = xfs_ag_resv_init(agibp->b_pag, tp);
+
+	if (XFS_TEST_ERROR(false, mp, XFS_ERRTAG_SHRINKFS_AG_RESV_FAIL))
+		err2 = -ENOSPC;
+
 	if (err2) {
 		be32_add_cpu(&agi->agi_length, len);
 		be32_add_cpu(&agf->agf_length, len);
