@@ -489,7 +489,7 @@ static int z_erofs_register_collection(struct z_erofs_collector *clt,
 			Z_EROFS_PCLUSTER_FULL_LENGTH : 0);
 
 	if (map->m_flags & EROFS_MAP_ZIPPED)
-		pcl->algorithmformat = Z_EROFS_COMPRESSION_LZ4;
+		pcl->algorithmformat = EROFS_I(inode)->z_algorithmtype[0];
 	else
 		pcl->algorithmformat = Z_EROFS_COMPRESSION_SHIFTED;
 
