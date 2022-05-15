@@ -7,10 +7,10 @@
 #define __EROFS_FS_ZDATA_H
 
 #include "internal.h"
-#include "zpvec.h"
+#include "tagptr.h"
 
 #define Z_EROFS_PCLUSTER_MAX_PAGES	(Z_EROFS_PCLUSTER_MAX_SIZE / PAGE_SIZE)
-#define Z_EROFS_NR_INLINE_PAGEVECS      3
+#define Z_EROFS_INLINE_BVECS		2
 
 #define Z_EROFS_PCLUSTER_FULL_LENGTH    0x00000001
 #define Z_EROFS_PCLUSTER_LENGTH_BIT     1
@@ -33,7 +33,7 @@ struct name { \
 	struct z_erofs_bvec bvec[total]; \
 };
 __Z_EROFS_BVSET(z_erofs_bvset,)
-__Z_EROFS_BVSET(z_erofs_bvset_inline, Z_EROFS_NR_INLINE_PAGEVECS)
+__Z_EROFS_BVSET(z_erofs_bvset_inline, Z_EROFS_INLINE_BVECS)
 
 /*
  * Structure fields follow one of the following exclusion rules.
@@ -68,9 +68,6 @@ struct z_erofs_pcluster {
 	unsigned int vcnt;
 
 	union {
-		/* L: inline a certain number of pagevecs for bootstrap */
-		erofs_vtptr_t pagevec[Z_EROFS_NR_INLINE_PAGEVECS];
-
 		/* L: inline a certain number of bvec for bootstrap */
 		struct z_erofs_bvset_inline bvset;
 
