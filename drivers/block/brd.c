@@ -24,7 +24,8 @@
 #include <linux/slab.h>
 #include <linux/backing-dev.h>
 #include <linux/debugfs.h>
-
+#include <linux/dax.h>
+#include <linux/pfn_t.h>
 #include <linux/uaccess.h>
 
 /*
@@ -34,6 +35,7 @@
 struct brd_device {
 	int			brd_number;
 	struct gendisk		*brd_disk;
+	struct dax_device	*dax_dev;
 	struct list_head	brd_list;
 
 	/*
@@ -44,6 +46,14 @@ struct brd_device {
 	struct radix_tree_root	brd_pages;
 	u64			brd_nr_pages;
 };
+
+#ifdef CONFIG_FS_DAX
+static bool enable_fsdax = true;
+module_param(enable_fsdax, bool, 0444);
+MODULE_PARM_DESC(enable_fsdax, "Enable FSDAX for RAM disk");
+#else
+#define enable_fsdax	false
+#endif
 
 /*
  * Look up and return a brd's page for a given sector.
@@ -90,7 +100,9 @@ static struct page *brd_insert_page(struct brd_device *brd, sector_t sector)
 	 * Must use NOIO because we don't want to recurse back into the
 	 * block or filesystem layers from page reclaim.
 	 */
-	gfp_flags = GFP_NOIO | __GFP_ZERO | __GFP_HIGHMEM;
+	gfp_flags = GFP_NOIO | __GFP_ZERO;
+	if (!enable_fsdax)
+		gfp_flags |= __GFP_HIGHMEM;
 	page = alloc_page(gfp_flags);
 	if (!page)
 		return NULL;
@@ -121,9 +133,9 @@ static struct page *brd_insert_page(struct brd_device *brd, sector_t sector)
  * there are no other users of the device.
  */
 #define FREE_BATCH 16
-static void brd_free_pages(struct brd_device *brd)
+static void brd_free_pages(struct brd_device *brd, unsigned long pos,
+			   unsigned long end)
 {
-	unsigned long pos = 0;
 	int nr_pages;
 
 	do {
@@ -131,6 +143,7 @@ static void brd_free_pages(struct brd_device *brd)
 		void __rcu **slot;
 
 		nr_pages = 0;
+		spin_lock(&brd->brd_lock);
 		radix_tree_for_each_slot(slot, &brd->brd_pages, &iter, pos) {
 			struct page *page = rcu_dereference_raw(*slot);
 
@@ -140,12 +153,17 @@ static void brd_free_pages(struct brd_device *brd)
 				slot = radix_tree_iter_retry(&iter);
 				continue;
 			}
+			if (iter.index > end) {
+				spin_unlock(&brd->brd_lock);
+				return;
+			}
 			radix_tree_iter_delete(&brd->brd_pages, &iter, slot);
 			__free_page(page);
 
 			if (++nr_pages == FREE_BATCH)
 				break;
 		}
+		spin_unlock(&brd->brd_lock);
 
 		pos = iter.index + 1;
 
@@ -354,6 +372,38 @@ __setup("ramdisk_size=", ramdisk_size);
 static LIST_HEAD(brd_devices);
 static struct dentry *brd_debugfs_dir;
 
+static long brd_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
+		long nr_pages, enum dax_access_mode mode, void **kaddr,
+		pfn_t *pfn)
+{
+	struct brd_device *brd = dax_get_private(dax_dev);
+	struct page *page = brd_insert_page(brd, pgoff << PAGE_SECTORS_SHIFT);
+
+	if (!page)
+		return -EIO;
+	if (kaddr)
+		*kaddr = page_address(page);
+	if (pfn)
+		*pfn = __pfn_to_pfn_t(page_to_pfn(page), PFN_DEV|PFN_MAP);
+	return 1;
+}
+
+static int brd_dax_zero_page_range(struct dax_device *dax_dev, pgoff_t pgoff,
+				   size_t nr_pages)
+{
+	struct brd_device *brd = dax_get_private(dax_dev);
+
+	brd_free_pages(brd, pgoff, pgoff + nr_pages - 1);
+	return 0;
+}
+
+static const struct dax_operations brd_dax_ops = {
+	.direct_access = brd_dax_direct_access,
+	.zero_page_range = brd_dax_zero_page_range,
+};
+
+void run_dax(struct dax_device *dax_dev);
+
 static int brd_alloc(int i)
 {
 	struct brd_device *brd;
@@ -402,12 +452,29 @@ static int brd_alloc(int i)
 	/* Tell the block layer that this is not a rotational device */
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, disk->queue);
 	blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, disk->queue);
+
+	if (enable_fsdax)
+		blk_queue_flag_set(QUEUE_FLAG_DAX, disk->queue);
 	err = add_disk(disk);
 	if (err)
 		goto out_cleanup_disk;
 
+	if (enable_fsdax) {
+		brd->dax_dev = alloc_dax(brd, &brd_dax_ops);
+		if (IS_ERR(brd->dax_dev)) {
+			brd->dax_dev = NULL;
+			goto out_del_gendisk;
+		}
+		set_dax_nocache(brd->dax_dev);
+		set_dax_nomc(brd->dax_dev);
+		run_dax(brd->dax_dev);
+		if (dax_add_host(brd->dax_dev, disk))
+			goto out_del_gendisk;
+	}
 	return 0;
 
+out_del_gendisk:
+	del_gendisk(disk);
 out_cleanup_disk:
 	blk_cleanup_disk(disk);
 out_free_dev:
@@ -428,9 +495,15 @@ static void brd_cleanup(void)
 	debugfs_remove_recursive(brd_debugfs_dir);
 
 	list_for_each_entry_safe(brd, next, &brd_devices, brd_list) {
+		if (brd->dax_dev) {
+			dax_remove_host(brd->brd_disk);
+			kill_dax(brd->dax_dev);
+			put_dax(brd->dax_dev);
+			brd->dax_dev = NULL;
+		}
 		del_gendisk(brd->brd_disk);
 		blk_cleanup_disk(brd->brd_disk);
-		brd_free_pages(brd);
+		brd_free_pages(brd, 0, ~0UL);
 		list_del(&brd->brd_list);
 		kfree(brd);
 	}
