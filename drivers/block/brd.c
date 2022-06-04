@@ -29,10 +29,7 @@
 
 /*
  * Each block ramdisk device has a radix_tree brd_pages of pages that stores
- * the pages containing the block device's contents. A brd page's ->index is
- * its offset in PAGE_SIZE units. This is similar to, but in no way connected
- * with, the kernel's pagecache or buffer cache (which sit above our block
- * device).
+ * the pages containing the block device's contents.
  */
 struct brd_device {
 	int			brd_number;
@@ -71,9 +68,6 @@ static struct page *brd_lookup_page(struct brd_device *brd, sector_t sector)
 	idx = sector >> PAGE_SECTORS_SHIFT; /* sector to page index */
 	page = radix_tree_lookup(&brd->brd_pages, idx);
 	rcu_read_unlock();
-
-	BUG_ON(page && page->index != idx);
-
 	return page;
 }
 
@@ -108,12 +102,10 @@ static struct page *brd_insert_page(struct brd_device *brd, sector_t sector)
 
 	spin_lock(&brd->brd_lock);
 	idx = sector >> PAGE_SECTORS_SHIFT;
-	page->index = idx;
 	if (radix_tree_insert(&brd->brd_pages, idx, page)) {
 		__free_page(page);
 		page = radix_tree_lookup(&brd->brd_pages, idx);
 		BUG_ON(!page);
-		BUG_ON(page->index != idx);
 	} else {
 		brd->brd_nr_pages++;
 	}
@@ -132,38 +124,36 @@ static struct page *brd_insert_page(struct brd_device *brd, sector_t sector)
 static void brd_free_pages(struct brd_device *brd)
 {
 	unsigned long pos = 0;
-	struct page *pages[FREE_BATCH];
 	int nr_pages;
 
 	do {
-		int i;
+		struct radix_tree_iter iter;
+		void __rcu **slot;
 
-		nr_pages = radix_tree_gang_lookup(&brd->brd_pages,
-				(void **)pages, pos, FREE_BATCH);
+		nr_pages = 0;
+		radix_tree_for_each_slot(slot, &brd->brd_pages, &iter, pos) {
+			struct page *page = rcu_dereference_raw(*slot);
 
-		for (i = 0; i < nr_pages; i++) {
-			void *ret;
+			if (!page)
+				continue;
+			if (radix_tree_is_internal_node(page)) {
+				slot = radix_tree_iter_retry(&iter);
+				continue;
+			}
+			radix_tree_iter_delete(&brd->brd_pages, &iter, slot);
+			__free_page(page);
 
-			BUG_ON(pages[i]->index < pos);
-			pos = pages[i]->index;
-			ret = radix_tree_delete(&brd->brd_pages, pos);
-			BUG_ON(!ret || ret != pages[i]);
-			__free_page(pages[i]);
+			if (++nr_pages == FREE_BATCH)
+				break;
 		}
 
-		pos++;
+		pos = iter.index + 1;
 
 		/*
 		 * It takes 3.4 seconds to remove 80GiB ramdisk.
 		 * So, we need cond_resched to avoid stalling the CPU.
 		 */
 		cond_resched();
-
-		/*
-		 * This assumes radix_tree_gang_lookup always returns as
-		 * many pages as possible. If the radix-tree code changes,
-		 * so will this have to.
-		 */
 	} while (nr_pages == FREE_BATCH);
 }
 
