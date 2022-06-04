@@ -11,7 +11,7 @@
 
 #include "do_mounts.h"
 #include "../fs/squashfs/squashfs_fs.h"
-
+#include "../fs/erofs/erofs_fs.h"
 #include <linux/decompress/generic.h>
 
 static struct file *in_file, *out_file;
@@ -63,6 +63,7 @@ identify_ramdisk_image(struct file *file, loff_t pos,
 	struct romfs_super_block *romfsb;
 	struct cramfs_super *cramfsb;
 	struct squashfs_super_block *squashfsb;
+	struct erofs_super_block *erofsb;
 	int nblocks = -1;
 	unsigned char *buf;
 	const char *compress_name;
@@ -77,6 +78,7 @@ identify_ramdisk_image(struct file *file, loff_t pos,
 	romfsb = (struct romfs_super_block *) buf;
 	cramfsb = (struct cramfs_super *) buf;
 	squashfsb = (struct squashfs_super_block *) buf;
+	erofsb = (struct erofs_super_block *) buf;
 	memset(buf, 0xe5, size);
 
 	/*
@@ -162,6 +164,15 @@ identify_ramdisk_image(struct file *file, loff_t pos,
 		       "RAMDISK: ext2 filesystem found at block %d\n",
 		       start_block);
 		nblocks = n;
+		goto done;
+	}
+
+	if (erofsb->magic == EROFS_SUPER_MAGIC_V1) {
+		printk(KERN_NOTICE
+		       "RAMDISK: EROFS filesystem found at block %d\n",
+		       start_block);
+		nblocks = (erofsb->blocks << erofsb->blkszbits) >>
+				BLOCK_SIZE_BITS;
 		goto done;
 	}
 
