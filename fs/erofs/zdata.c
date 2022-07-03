@@ -804,9 +804,12 @@ retry:
 	/* bump up the number of spiltted parts of a page */
 	++spiltted;
 
-	/* also update nr_pages */
+	/* XXX: update the largest count of decompressed pages and its pageofs_out */
 	index = page->index - (map->m_la >> PAGE_SHIFT);
-	fe->pcl->nr_pages = max_t(pgoff_t, fe->pcl->nr_pages, index + 1);
+	if (index + 1 > fe->pcl->nr_pages) {
+		fe->pcl->nr_pages = index + 1;
+		fe->pcl->pageofs_out = map->m_la & ~PAGE_MASK;
+	}
 next_part:
 	/* can be used for verification */
 	map->m_llen = offset + cur - map->m_la;
@@ -855,28 +858,82 @@ struct z_erofs_decompress_backend {
 	/* pages to keep the compressed data */
 	struct page **compressed_pages;
 
+	struct list_head decompressed_secondary_bvecs;
+
 	struct page **pagepool;
-	unsigned int onstack_used;
+	unsigned int onstack_used, outputsize;
+};
+
+struct z_erofs_bvec_item {
+	struct z_erofs_bvec bvec;
+	struct list_head list;
 };
 
 static int z_erofs_do_decompressed_bvec(struct z_erofs_decompress_backend *be,
 					struct z_erofs_bvec *bvec)
 {
-	unsigned int pgnr = (bvec->offset + be->pcl->pageofs_out) >> PAGE_SHIFT;
-	struct page *oldpage;
+	struct z_erofs_bvec_item *item;
 
-	DBG_BUGON(pgnr >= be->pcl->nr_pages);
-	oldpage = be->decompressed_pages[pgnr];
-	be->decompressed_pages[pgnr] = bvec->page;
+	if (!((bvec->offset + be->pcl->pageofs_out) & ~PAGE_MASK)) {
+		unsigned int pgnr;
+		struct page *oldpage;
 
-	/* error out if one pcluster is refenenced multiple times. */
-	if (oldpage) {
-		DBG_BUGON(1);
-		z_erofs_page_mark_eio(oldpage);
-		z_erofs_onlinepage_endio(oldpage);
-		return -EFSCORRUPTED;
+		pgnr = (bvec->offset + be->pcl->pageofs_out) >> PAGE_SHIFT;
+		DBG_BUGON(pgnr >= be->pcl->nr_pages);
+		oldpage = be->decompressed_pages[pgnr];
+		be->decompressed_pages[pgnr] = bvec->page;
+
+		if (!oldpage)
+			return 0;
 	}
+
+	/* (somewhat cold path) one pcluster refenenced multiple times */
+	item = kmalloc(sizeof(*item), GFP_KERNEL | __GFP_NOFAIL);
+	list_add(&item->list, &be->decompressed_secondary_bvecs);
 	return 0;
+}
+
+static void z_erofs_fill_duplicated_copy(struct z_erofs_decompress_backend *be)
+{
+	unsigned char *src = NULL;
+	unsigned int mappednr;
+	struct list_head *p, *n;
+
+	list_for_each_safe(p, n, &be->decompressed_secondary_bvecs) {
+		struct z_erofs_bvec_item *bvi;
+		unsigned int end, cur = 0;
+		int off0;
+		void *dst;
+
+		bvi = container_of(p, struct z_erofs_bvec_item, list);
+		dst = kmap_local_page(bvi->bvec.page);
+
+		if (bvi->bvec.offset < 0)
+			cur = -bvi->bvec.offset;
+		off0 = bvi->bvec.offset + (bvi->bvec.offset & ~PAGE_MASK);
+		end = min_t(unsigned int, be->outputsize - off0, PAGE_SIZE);
+		off0 -= be->pcl->pageofs_out;
+		while (cur < end) {
+			unsigned int pgnr, scur;
+
+			pgnr = (off0 + cur + PAGE_SIZE - 1) >> PAGE_SHIFT;
+			if (src && mappednr != pgnr) {
+				kunmap_local(src);
+				src = NULL;
+			}
+			scur = (pgnr << PAGE_SHIFT) - (off0 + cur);
+
+			if (!src)
+				src = kmap_local_page(
+						be->decompressed_pages[pgnr]);
+			memcpy(dst + cur, src + scur, end - max(cur, scur));
+		}
+		kunmap_local(dst);
+		z_erofs_onlinepage_endio(bvi->bvec.page);
+	}
+
+	if (src)
+		kunmap_local(src);
 }
 
 static int z_erofs_parse_out_bvecs(struct z_erofs_decompress_backend *be)
@@ -953,7 +1010,7 @@ static int z_erofs_decompress_pcluster(struct z_erofs_decompress_backend *be,
 	struct erofs_sb_info *const sbi = EROFS_SB(be->sb);
 	struct z_erofs_pcluster *pcl = be->pcl;
 	unsigned int pclusterpages = z_erofs_pclusterpages(pcl);
-	unsigned int i, inputsize, outputsize, llen, nr_pages, err2;
+	unsigned int i, inputsize, llen, nr_pages, err2;
 	struct page *page;
 	bool overlapped, partial;
 
@@ -993,10 +1050,10 @@ static int z_erofs_decompress_pcluster(struct z_erofs_decompress_backend *be,
 
 	llen = pcl->length >> Z_EROFS_PCLUSTER_LENGTH_BIT;
 	if (nr_pages << PAGE_SHIFT >= pcl->pageofs_out + llen) {
-		outputsize = llen;
+		be->outputsize = llen;
 		partial = !(pcl->length & Z_EROFS_PCLUSTER_FULL_LENGTH);
 	} else {
-		outputsize = (nr_pages << PAGE_SHIFT) - pcl->pageofs_out;
+		be->outputsize = (nr_pages << PAGE_SHIFT) - pcl->pageofs_out;
 		partial = true;
 	}
 
@@ -1012,7 +1069,7 @@ static int z_erofs_decompress_pcluster(struct z_erofs_decompress_backend *be,
 					.pageofs_in = pcl->pageofs_in,
 					.pageofs_out = pcl->pageofs_out,
 					.inputsize = inputsize,
-					.outputsize = outputsize,
+					.outputsize = be->outputsize,
 					.alg = pcl->algorithmformat,
 					.inplace_io = overlapped,
 					.partial_decoding = partial
@@ -1039,6 +1096,7 @@ out:
 	if (be->compressed_pages < be->onstack_pages ||
 	    be->compressed_pages >= be->onstack_pages + Z_EROFS_ONSTACK_PAGES)
 		kvfree(be->compressed_pages);
+	z_erofs_fill_duplicated_copy(be);
 
 	for (i = 0; i < nr_pages; ++i) {
 		page = be->decompressed_pages[i];
@@ -1074,6 +1132,8 @@ static void z_erofs_decompress_queue(const struct z_erofs_decompressqueue *io,
 	struct z_erofs_decompress_backend be = {
 		.sb = io->sb,
 		.pagepool = pagepool,
+		.decompressed_secondary_bvecs =
+			LIST_HEAD_INIT(be.decompressed_secondary_bvecs),
 	};
 	z_erofs_next_pcluster_t owned = io->head;
 
