@@ -11,6 +11,7 @@
 
 #define Z_EROFS_PCLUSTER_MAX_PAGES	(Z_EROFS_PCLUSTER_MAX_SIZE / PAGE_SIZE)
 #define Z_EROFS_INLINE_BVECS		2
+extern atomic_t erofs_tmppagecount;
 
 /*
  * let's leave a type here in case of introducing
@@ -608,8 +609,10 @@ static void z_erofs_bind_cache(struct z_erofs_decompress_frontend *fe)
 
 		if (page)
 			put_page(page);
-		else if (newpage)
+		else if (newpage) {
 			erofs_pagepool_add(&fe->pagepool, newpage);
+			atomic_dec(&erofs_tmppagecount);
+		}
 	}
 
 	/*
@@ -1527,6 +1530,7 @@ out_allocpage:
 	page = erofs_allocpage(pagepool, gfp | __GFP_NOFAIL);
 	if (oldpage != cmpxchg(&pcl->compressed_bvecs[nr].page,
 			       oldpage, page)) {
+		atomic_dec(&erofs_tmppagecount);
 		erofs_pagepool_add(pagepool, page);
 		cond_resched();
 		goto repeat;
@@ -1537,6 +1541,7 @@ out_tocache:
 		set_page_private(page, Z_EROFS_SHORTLIVED_PAGE);
 		goto out;
 	}
+	atomic_dec(&erofs_tmppagecount);
 	attach_page_private(page, pcl);
 	/* drop a refcount added by allocpage (then we have 2 refs here) */
 	put_page(page);

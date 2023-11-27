@@ -4,6 +4,9 @@
  *             https://www.huawei.com/
  */
 #include "internal.h"
+#include "compress.h"
+
+atomic_t erofs_tmppagecount;
 
 struct page *erofs_allocpage(struct page **pagepool, gfp_t gfp)
 {
@@ -15,6 +18,7 @@ struct page *erofs_allocpage(struct page **pagepool, gfp_t gfp)
 	} else {
 		page = alloc_page(gfp);
 	}
+	atomic_inc(&erofs_tmppagecount);
 	return page;
 }
 
@@ -154,8 +158,17 @@ static unsigned long erofs_shrink_workstation(struct erofs_sb_info *sbi,
 	struct erofs_workgroup *grp;
 	unsigned int freed = 0;
 	unsigned long index;
+	static unsigned int jiffies_old;
 
 	xa_lock(&sbi->managed_pslots);
+
+	if (jiffies >= jiffies_old + HZ * 5) {
+		pr_err("cached page count: %lu / tmp page count: %u / global shrink cnt: %ld\n",
+		       MNGD_MAPPING(sbi)->nrpages, atomic_read(&erofs_tmppagecount),
+		       atomic_long_read(&erofs_global_shrink_cnt));
+		jiffies_old = jiffies;
+	}
+
 	xa_for_each(&sbi->managed_pslots, index, grp) {
 		/* try to shrink each valid workgroup */
 		if (!erofs_try_to_release_workgroup(sbi, grp))

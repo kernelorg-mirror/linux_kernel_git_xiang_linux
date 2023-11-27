@@ -69,6 +69,8 @@ static inline bool z_erofs_is_shortlived_page(struct page *page)
 static inline bool z_erofs_put_shortlivedpage(struct page **pagepool,
 					      struct page *page)
 {
+	extern atomic_t erofs_tmppagecount;
+
 	if (!z_erofs_is_shortlived_page(page))
 		return false;
 
@@ -76,6 +78,8 @@ static inline bool z_erofs_put_shortlivedpage(struct page **pagepool,
 	if (page_ref_count(page) > 1) {
 		put_page(page);
 	} else {
+		atomic_dec(&erofs_tmppagecount);
+
 		/* follow the pcluster rule above. */
 		erofs_pagepool_add(pagepool, page);
 	}
